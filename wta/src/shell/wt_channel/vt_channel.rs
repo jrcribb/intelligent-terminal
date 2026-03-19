@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{Read, Write, IsTerminal};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -19,16 +19,12 @@ pub enum DiscoverySource {
 }
 
 /// Discover WT protocol connection info with fallback chain:
-/// 1. VT OSC 9001 discover sequence (works in any WT pane)
-/// 2. Environment variables WT_PIPE_NAME / WT_MCP_TOKEN (coordinator panes only)
+/// 1. Environment variable WT_PIPE_NAME (always set by WT via SetEnvironmentVariableW)
+/// 2. VT OSC 9001 discover sequence (legacy fallback, only when stdout is a TTY)
 /// 3. None (not running inside Windows Terminal)
 pub fn discover_connection_info() -> Option<ConnectionInfo> {
-    // Try VT discovery first
-    if let Some(info) = try_vt_discover() {
-        return Some(info);
-    }
-
-    // Fall back to environment variables
+    // Try environment variables first — WT injects WT_PIPE_NAME into the
+    // process environment so all child panes inherit it automatically.
     if let Ok(pipe_name) = std::env::var("WT_PIPE_NAME") {
         let token = std::env::var("WT_MCP_TOKEN").unwrap_or_default();
         return Some(ConnectionInfo {
@@ -36,6 +32,13 @@ pub fn discover_connection_info() -> Option<ConnectionInfo> {
             token,
             source: DiscoverySource::EnvVar,
         });
+    }
+
+    // Fall back to VT discovery (only works when stdout is a real terminal)
+    if std::io::stdout().is_terminal() {
+        if let Some(info) = try_vt_discover() {
+            return Some(info);
+        }
     }
 
     None

@@ -88,6 +88,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             static constexpr std::wstring_view builtinWslEnvVars[] = {
                 L"WT_SESSION",
                 L"WT_PROFILE_ID",
+                L"WT_PIPE_NAME",
             };
             // Misdiagnosis in MSVC 14.44.35207. No pointer arithmetic in sight.
 #pragma warning(suppress : 26481) // Don't use pointer arithmetic. Use span instead (bounds.1).

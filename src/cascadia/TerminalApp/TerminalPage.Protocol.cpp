@@ -625,14 +625,10 @@ namespace winrt::TerminalApp::implementation
                     commandline = L"cmd.exe";
                 }
 
-                // Wrap the commandline to print protocol credentials before launching.
-                // This helps developers grab WT_PIPE_NAME / WT_MCP_TOKEN from the pane.
-                auto wrappedCmd = fmt::format(
-                    L"cmd.exe /c \"echo WT_PIPE_NAME=%WT_PIPE_NAME% && echo WT_MCP_TOKEN=%WT_MCP_TOKEN% && {}\"",
-                    commandline);
-
+                // No cmd.exe wrapper needed — WT_PIPE_NAME is inherited from
+                // the process environment, set in WindowEmperor::_startProtocolServer().
                 NewTerminalArgs newTermArgs;
-                newTermArgs.Commandline(winrt::hstring{ wrappedCmd });
+                newTermArgs.Commandline(winrt::hstring{ commandline });
 
                 const auto profile = globals.AiCoordinatorProfile();
                 if (!profile.empty())

@@ -1497,6 +1497,11 @@ void WindowEmperor::_initializeProtocolServer()
     // Create the named pipe name using the process ID for uniqueness.
     _protocolPipeName = fmt::format(L"\\\\.\\pipe\\WindowsTerminal-{}", GetCurrentProcessId());
 
+    // Inject WT_PIPE_NAME into the process environment so ALL child panes
+    // inherit it automatically (like WT_SESSION). This lets wta and other
+    // tools discover the pipe without VT escape sequences.
+    SetEnvironmentVariableW(L"WT_PIPE_NAME", _protocolPipeName.c_str());
+
     // Create the handler and server.
     _protocolHandler = std::make_unique<ProtocolRequestHandler>(*this);
     _protocolHandler->SetAuthToken(_mcpToken);
@@ -1655,15 +1660,11 @@ void WindowEmperor::_startCoordinatorIfEnabled()
         fullCommandline += mcpConfigPath.wstring();
     }
 
-    // Wrap the commandline to print protocol credentials in the pane before launching.
-    auto wrappedCommandline = fmt::format(
-        L"cmd.exe /c \"echo WT_PIPE_NAME={} && echo WT_MCP_TOKEN={} && {}\"",
-        _protocolPipeName,
-        winrt::to_hstring(_mcpToken),
-        fullCommandline);
-
+    // No cmd.exe wrapper needed — WT_PIPE_NAME is injected globally via
+    // SetEnvironmentVariableW in _startProtocolServer(), and WT_MCP_TOKEN
+    // is injected via SetPendingProtocolEnv below.
     NewTerminalArgs newTermArgs;
-    newTermArgs.Commandline(winrt::hstring{ wrappedCommandline });
+    newTermArgs.Commandline(winrt::hstring{ fullCommandline });
 
     const auto profile = globals.AiCoordinatorProfile();
     if (!profile.empty())
@@ -1674,9 +1675,9 @@ void WindowEmperor::_startCoordinatorIfEnabled()
     newTermArgs.TabTitle(L"Terminal Coordinator");
     newTermArgs.SuppressApplicationTitle(true);
 
-    // Inject WT_MCP_TOKEN and WT_PIPE_NAME into the coordinator's environment.
+    // Inject WT_MCP_TOKEN into the coordinator's environment.
+    // WT_PIPE_NAME is already inherited from the process environment.
     page.SetPendingProtocolEnv(L"WT_MCP_TOKEN", winrt::to_hstring(_mcpToken));
-    page.SetPendingProtocolEnv(L"WT_PIPE_NAME", winrt::hstring{ _protocolPipeName });
 
     // Inject WT_MCP_CONFIG (JSON) and WT_MCP_CONFIG_PATH (file path)
     // so the coordinator can pass them to delegates.
