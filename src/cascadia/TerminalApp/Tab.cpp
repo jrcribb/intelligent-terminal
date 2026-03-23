@@ -2018,6 +2018,96 @@ namespace winrt::TerminalApp::implementation
         return _zoomedPane != nullptr;
     }
 
+    // Method Description:
+    // - Toggle the visibility of a pane in this tab.
+    //   * If no pane is hidden, hide the currently active pane. Its sibling
+    //     will expand to fill the space.
+    //   * If a pane is already hidden, restore it to its original position.
+    void Tab::TogglePaneVisibility()
+    {
+        ASSERT_UI_THREAD();
+
+        if (_hiddenPane)
+        {
+            ShowPane();
+        }
+        else
+        {
+            HidePane();
+        }
+    }
+
+    // Method Description:
+    // - Hide the currently active pane. The pane's sibling will expand to fill
+    //   the parent's space. The pane tree structure is preserved in memory.
+    void Tab::HidePane()
+    {
+        ASSERT_UI_THREAD();
+
+        // Can't hide if there's only one pane, or if we're the root pane.
+        if (_rootPane->_IsLeaf())
+        {
+            return;
+        }
+
+        // Find the parent of the active pane.
+        const auto parent = _rootPane->_FindParentOfPane(_activePane);
+        if (!parent)
+        {
+            return;
+        }
+
+        _hiddenPane = _activePane;
+
+        // Determine the sibling that will remain visible.
+        const auto& sibling = (parent->_firstChild == _hiddenPane) ?
+                                  parent->_secondChild :
+                                  parent->_firstChild;
+
+        // Hide the pane in the XAML tree.
+        parent->HidePane(_hiddenPane);
+
+        // Move focus to the sibling (find the last-active leaf within it).
+        const auto focusTarget = sibling->GetActivePane();
+        if (focusTarget)
+        {
+            _UpdateActivePane(focusTarget);
+            focusTarget->SetActive();
+        }
+    }
+
+    // Method Description:
+    // - Show the previously hidden pane, restoring it to its original position
+    //   with the original split ratio.
+    void Tab::ShowPane()
+    {
+        ASSERT_UI_THREAD();
+
+        if (!_hiddenPane)
+        {
+            return;
+        }
+
+        // Find the parent that owns the hidden pane.
+        const auto parent = _rootPane->_FindParentOfPane(_hiddenPane);
+        if (!parent)
+        {
+            _hiddenPane = nullptr;
+            return;
+        }
+
+        // Restore the pane in the XAML tree.
+        parent->RestorePane(_hiddenPane);
+        _hiddenPane = nullptr;
+    }
+
+    bool Tab::HasHiddenPane()
+    {
+        ASSERT_UI_THREAD();
+
+        return _hiddenPane != nullptr;
+    }
+
     TermControl _termControlFromPane(const auto& pane)
     {
         if (const auto content{ pane->GetContent() })

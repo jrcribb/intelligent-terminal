@@ -2427,6 +2427,91 @@ void Pane::Restore(std::shared_ptr<Pane> zoomedPane)
 }
 
 // Method Description:
+// - Hide a pane within the tree. The parent of the hidden pane removes it from
+//   the UI tree and gives all space to the remaining sibling. The tree structure
+//   (split state, split position, child pointers) is preserved in memory.
+// Arguments:
+// - hiddenPane: The pane to hide. Must be a direct child of this pane.
+// Return Value:
+// - <none>
+void Pane::HidePane(std::shared_ptr<Pane> hiddenPane)
+{
+    hiddenPane->_hidden = true;
+    if (!_IsLeaf())
+    {
+        if (hiddenPane == _firstChild || hiddenPane == _secondChild)
+        {
+            // Remove both children from the UI tree, then re-add only the
+            // visible one so it fills all the space.
+            _root.Children().Clear();
+            _borderFirst.Child(nullptr);
+            _borderSecond.Child(nullptr);
+
+            const auto& visibleChild = (hiddenPane == _firstChild) ? _secondChild : _firstChild;
+            const auto& visibleBorder = (hiddenPane == _firstChild) ? _borderSecond : _borderFirst;
+
+            visibleBorder.Child(visibleChild->GetRootElement());
+            _root.Children().Append(visibleBorder);
+
+            // Give the visible child the full space by collapsing the grid
+            // definitions to a single star-sized track.
+            if (_splitState == SplitState::Vertical)
+            {
+                _root.ColumnDefinitions().Clear();
+                auto colDef = Controls::ColumnDefinition();
+                colDef.Width(GridLengthHelper::FromValueAndType(1.0, GridUnitType::Star));
+                _root.ColumnDefinitions().Append(colDef);
+                Controls::Grid::SetColumn(visibleBorder, 0);
+            }
+            else if (_splitState == SplitState::Horizontal)
+            {
+                _root.RowDefinitions().Clear();
+                auto rowDef = Controls::RowDefinition();
+                rowDef.Height(GridLengthHelper::FromValueAndType(1.0, GridUnitType::Star));
+                _root.RowDefinitions().Append(rowDef);
+                Controls::Grid::SetRow(visibleBorder, 0);
+            }
+
+            // Update borders so the visible child gets the full border set.
+            visibleChild->_borders = _borders;
+            visibleChild->_ApplySplitDefinitions();
+        }
+    }
+}
+
+// Method Description:
+// - Restore a previously hidden pane. The parent re-adds both children to the
+//   UI tree and restores the original split ratio from _desiredSplitPosition.
+// Arguments:
+// - hiddenPane: The pane to restore. Must be a direct child of this pane.
+// Return Value:
+// - <none>
+void Pane::RestorePane(std::shared_ptr<Pane> hiddenPane)
+{
+    hiddenPane->_hidden = false;
+    if (!_IsLeaf())
+    {
+        if (hiddenPane == _firstChild || hiddenPane == _secondChild)
+        {
+            // Re-add both children in the correct order.
+            _root.Children().Clear();
+            _borderFirst.Child(nullptr);
+            _borderSecond.Child(nullptr);
+
+            _borderFirst.Child(_firstChild->GetRootElement());
+            _borderSecond.Child(_secondChild->GetRootElement());
+
+            _root.Children().Append(_borderFirst);
+            _root.Children().Append(_borderSecond);
+
+            // Restore the original split ratio.
+            _CreateRowColDefinitions();
+            _ApplySplitDefinitions();
+        }
+    }
+}
+
+// Method Description:
 // - Retrieves the ID of this pane
 // - NOTE: The caller should make sure that this pane is a leaf,
 //   otherwise the ID value will not make sense (leaves have IDs, parents do not)

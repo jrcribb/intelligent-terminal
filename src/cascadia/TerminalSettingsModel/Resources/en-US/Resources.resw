@@ -499,6 +499,9 @@
   <data name="TogglePaneZoomCommandKey" xml:space="preserve">
     <value>Toggle pane zoom</value>
   </data>
+  <data name="TogglePaneVisibilityCommandKey" xml:space="preserve">
+    <value>Toggle pane visibility</value>
+  </data>
   <data name="TogglePaneReadOnlyCommandKey" xml:space="preserve">
     <value>Toggle pane read-only mode</value>
   </data>

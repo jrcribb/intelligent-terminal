@@ -80,6 +80,11 @@ namespace winrt::TerminalApp::implementation
         void EnterZoom();
         void ExitZoom();
 
+        void TogglePaneVisibility();
+        void HidePane();
+        void ShowPane();
+        bool HasHiddenPane();
+
         std::vector<Microsoft::Terminal::Settings::Model::ActionAndArgs> BuildStartupActions(BuildStartupKind kind) const;
 
         int GetLeafPaneCount() const noexcept;
@@ -158,6 +163,7 @@ namespace winrt::TerminalApp::implementation
         std::shared_ptr<Pane> _rootPane{ nullptr };
         std::shared_ptr<Pane> _activePane{ nullptr };
         std::shared_ptr<Pane> _zoomedPane{ nullptr };
+        std::shared_ptr<Pane> _hiddenPane{ nullptr };
 
         Windows::UI::Xaml::Controls::MenuFlyoutItem _closePaneMenuItem;
         Windows::UI::Xaml::Controls::MenuFlyoutItem _restartConnectionMenuItem;

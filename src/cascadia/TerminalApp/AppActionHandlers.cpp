@@ -317,6 +317,29 @@ namespace winrt::TerminalApp::implementation
         args.Handled(true);
     }
 
+    void TerminalPage::_HandleTogglePaneVisibility(const IInspectable& sender,
+                                                   const ActionEventArgs& args)
+    {
+        if (const auto activeTab{ _senderOrFocusedTab(sender) })
+        {
+            // Un-zoom first if needed, so the pane tree is fully visible
+            // before we toggle visibility.
+            if (activeTab->IsZoomed())
+            {
+                _tabContent.Children().Clear();
+                activeTab->ExitZoom();
+            }
+
+            // Only toggle if there are multiple panes (can't hide the only pane).
+            if (activeTab->GetLeafPaneCount() > 1 || activeTab->HasHiddenPane())
+            {
+                activeTab->TogglePaneVisibility();
+            }
+        }
+
+        args.Handled(true);
+    }
+
     void TerminalPage::_HandleTogglePaneReadOnly(const IInspectable& sender,
                                                  const ActionEventArgs& args)
     {

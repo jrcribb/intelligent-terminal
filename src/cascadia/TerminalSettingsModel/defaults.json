@@ -616,6 +616,7 @@
         { "command": { "action": "swapPane", "direction": "first" }, "id": "Terminal.SwapPaneFirst" },
         { "command": "toggleBroadcastInput", "id": "Terminal.ToggleBroadcastInput" },
         { "command": "togglePaneZoom", "id": "Terminal.TogglePaneZoom" },
+        { "command": "togglePaneVisibility", "id": "Terminal.TogglePaneVisibility" },
         { "command": "toggleSplitOrientation", "id": "Terminal.ToggleSplitOrientation" },
         { "command": "toggleReadOnlyMode", "id": "Terminal.ToggleReadOnlyMode" },
         { "command": "enableReadOnlyMode", "id": "Terminal.EnableReadOnlyMode" },

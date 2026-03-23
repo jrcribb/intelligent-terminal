@@ -139,6 +139,9 @@ public:
     void Maximize(std::shared_ptr<Pane> zoomedPane);
     void Restore(std::shared_ptr<Pane> zoomedPane);
 
+    void HidePane(std::shared_ptr<Pane> hiddenPane);
+    void RestorePane(std::shared_ptr<Pane> hiddenPane);
+
     std::optional<uint32_t> Id() noexcept;
     void Id(uint32_t id) noexcept;
     bool FocusPane(const uint32_t id);
@@ -276,6 +279,7 @@ private:
     Borders _borders{ Borders::None };
 
     bool _zoomed{ false };
+    bool _hidden{ false };
     bool _broadcastEnabled{ false };
 
     bool _IsLeaf() const noexcept;
