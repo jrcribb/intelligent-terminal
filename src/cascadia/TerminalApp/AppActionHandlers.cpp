@@ -1873,7 +1873,7 @@ if (-not $Global:__ShellInteg_Installed) {
         # ── Delegate to the user's ORIGINAL prompt — visual output is theirs ──
         $originalOutput = & $Global:__ShellInteg_OriginalPrompt
 
-        $Global:__ShellInteg_LastHistoryId = if ($entry) { $entry.Id } else { -1 }
+        $Global:__ShellInteg_LastHistoryId = if ($entry) { $entry.Id } else { 0 }
 
         return "${prefix}${originalOutput}${suffix}"
     }
