@@ -203,12 +203,17 @@ impl WtChannel for CliChannel {
             "read_pane_output" => {
                 let pane_id = params.get("pane_id").and_then(json_id_as_str).unwrap_or_default();
                 let max_lines = params.get("max_lines").and_then(|v| v.as_i64()).unwrap_or(200);
+                let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
                 let lines_owned = max_lines.to_string();
                 let mut args = vec!["capture-pane"];
                 if !pane_id.is_empty() {
                     args.extend(["-t", &pane_id]);
                 }
-                args.extend(["-l", &lines_owned]);
+                if source == "last_prompt" {
+                    args.push("--last-prompt");
+                } else {
+                    args.extend(["-l", &lines_owned]);
+                }
                 self.run_wtcli(&args).await
             }
             "get_process_status" => {

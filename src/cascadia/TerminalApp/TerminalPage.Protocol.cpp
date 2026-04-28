@@ -257,6 +257,31 @@ namespace winrt::TerminalApp::implementation
 
             try
             {
+                if (sourceStr == "last_prompt")
+                {
+                    // Special path: return only the most recent completed
+                    // shell prompt (command + output, bracketed by FTCS
+                    // marks). Avoids leaking arbitrary trailing buffer
+                    // content (older commands, secrets) to external agents.
+                    result.PaneId = paneId;
+                    const auto lastPrompt = termControl.ReadLastPrompt();
+                    auto lastPromptStr = winrt::to_string(lastPrompt);
+                    int32_t lineCount = 0;
+                    if (!lastPromptStr.empty())
+                    {
+                        lineCount = 1;
+                        for (auto ch : lastPromptStr)
+                        {
+                            if (ch == '\n')
+                                ++lineCount;
+                        }
+                    }
+                    result.Content = winrt::to_hstring(lastPromptStr);
+                    result.LineCount = lineCount;
+                    result.Truncated = false;
+                    co_return result;
+                }
+
                 fullBuffer = termControl.ReadEntireBuffer();
                 viewHeight = termControl.ViewHeight();
             }

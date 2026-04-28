@@ -748,18 +748,42 @@ async fn build_terminal_context_json(
                     .unwrap_or(false);
 
                 let buffer = if highlighted_panes.contains(&pane_id) {
-                    shell_mgr
-                        .wt_read_pane_output(&pane_id, Some(24))
+                    // Prefer the most recent completed shell prompt
+                    // (command + output, OSC 133 marks). Falls back to
+                    // the trailing 24 lines if shell integration is not
+                    // active or no prompt has completed yet. This keeps
+                    // unrelated history (and any secrets it may contain)
+                    // out of the LLM context.
+                    let from_last_prompt = shell_mgr
+                        .wt_read_last_prompt(&pane_id)
                         .await
                         .ok()
                         .and_then(|value| {
                             value
                                 .get("content")
                                 .and_then(|content| content.as_str())
-                                .map(|content| {
-                                    truncate_for_prompt(content, ACTIVE_PANE_CONTEXT_MAX_CHARS / 2)
-                                })
+                                .map(str::to_string)
                         })
+                        .filter(|content| !content.trim().is_empty());
+
+                    let raw = if let Some(content) = from_last_prompt {
+                        Some(content)
+                    } else {
+                        shell_mgr
+                            .wt_read_pane_output(&pane_id, Some(24))
+                            .await
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .get("content")
+                                    .and_then(|content| content.as_str())
+                                    .map(str::to_string)
+                            })
+                    };
+
+                    raw.map(|content| {
+                        truncate_for_prompt(&content, ACTIVE_PANE_CONTEXT_MAX_CHARS / 2)
+                    })
                 } else {
                     None
                 };
@@ -887,19 +911,42 @@ async fn build_prompt_text(
             if let Some(source_pane_id) = pane_context
                 .and_then(|ctx| ctx.effective_source_pane_id())
             {
-                if let Ok(value) = shell_mgr
-                    .wt_read_pane_output(source_pane_id, Some(30))
+                // Prefer the last completed prompt (just the failed
+                // command + its output) over the trailing 30 lines —
+                // narrower context, less risk of dragging in unrelated
+                // commands or secrets.
+                let last_prompt_text = shell_mgr
+                    .wt_read_last_prompt(source_pane_id)
                     .await
-                {
-                    if let Some(content) = value
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                    {
-                        runtime_sections.push(format!(
-                            "### Terminal Output\n```\n{}\n```",
-                            truncate_for_prompt(content, ACTIVE_PANE_CONTEXT_MAX_CHARS)
-                        ));
-                    }
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    })
+                    .filter(|content| !content.trim().is_empty());
+
+                let content_opt = if last_prompt_text.is_some() {
+                    last_prompt_text
+                } else {
+                    shell_mgr
+                        .wt_read_pane_output(source_pane_id, Some(30))
+                        .await
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string)
+                        })
+                };
+
+                if let Some(content) = content_opt {
+                    runtime_sections.push(format!(
+                        "### Terminal Output\n```\n{}\n```",
+                        truncate_for_prompt(&content, ACTIVE_PANE_CONTEXT_MAX_CHARS)
+                    ));
                 }
             }
         }

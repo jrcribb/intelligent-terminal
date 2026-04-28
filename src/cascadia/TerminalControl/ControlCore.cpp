@@ -2388,6 +2388,41 @@ namespace winrt::Microsoft::Terminal::Control::implementation
         return hstring{ str };
     }
 
+    // Returns the text of the most recent *completed* prompt — the command
+    // typed at the last shell prompt plus its full output, as bracketed by
+    // FinalTerm OSC 133;A/B/C/D marks. Used by external agents (wtcli /
+    // wta) to fetch a tightly-scoped pane snapshot instead of an arbitrary
+    // tail of the buffer (which may contain unrelated commands and secrets).
+    //
+    // Returns an empty hstring if shell integration is not active or no
+    // completed prompt is present yet.
+    hstring ControlCore::ReadLastPrompt() const
+    {
+        const auto lock = _terminal->LockForReading();
+        const auto& marks = _terminal->GetMarkExtents();
+
+        // Walk backwards looking for the most recent mark that has both a
+        // command region (B..C) and an output region (C..D). We require
+        // HasOutput() so that we only return prompts whose command has
+        // finished executing — partial output for an in-flight command may
+        // contain a half-typed secret.
+        for (auto it = marks.rbegin(); it != marks.rend(); ++it)
+        {
+            if (!it->HasCommand() || !it->HasOutput())
+            {
+                continue;
+            }
+
+            const auto start = it->end;        // FTCS B — command starts
+            const auto end = *it->outputEnd;   // FTCS D — output ends
+
+            const auto& textBuffer = _terminal->GetTextBuffer();
+            return hstring{ textBuffer.GetPlainText(start, end) };
+        }
+
+        return hstring{};
+    }
+
     // Get all of our recent commands. This will only really work if the user has enabled shell integration.
     Control::CommandHistoryContext ControlCore::CommandHistory() const
     {

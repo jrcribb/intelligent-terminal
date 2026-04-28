@@ -607,6 +607,21 @@ impl ShellManager {
             .await
     }
 
+    /// Read only the most recent completed shell prompt (command + output)
+    /// from a pane. Returns an empty `content` string if shell integration
+    /// (OSC 133) is not active or no prompt has completed yet — callers
+    /// should fall back to `wt_read_pane_output` in that case.
+    pub async fn wt_read_last_prompt(
+        &self,
+        pane_id: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let params = serde_json::json!({
+            "pane_id": pane_id,
+            "source": "last_prompt",
+        });
+        self.wt()?.request("read_pane_output", params).await
+    }
+
     /// Close a pane.
     pub async fn wt_close_pane(&self, pane_id: &str) -> anyhow::Result<serde_json::Value> {
         self.wt()?

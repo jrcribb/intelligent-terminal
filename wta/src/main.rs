@@ -172,6 +172,11 @@ enum Command {
         /// Maximum lines to capture
         #[arg(short = 'l', long)]
         max_lines: Option<u32>,
+
+        /// Only return the most recent completed shell prompt
+        /// (command + output). Requires OSC 133 shell integration.
+        #[arg(long)]
+        last_prompt: bool,
     },
 
     /// Close/kill a pane
@@ -426,12 +431,15 @@ async fn main() -> Result<()> {
         }
 
         // ── Capture pane ──
-        Some(Command::CapturePane { target, max_lines }) => {
+        Some(Command::CapturePane { target, max_lines, last_prompt }) => {
             let channel = connect_channel(&pipe_override).await?;
             let pane_id = resolve_pane_id(&channel, &target).await?;
             let mut params = json!({ "pane_id": pane_id });
             if let Some(n) = max_lines {
                 params["max_lines"] = json!(n);
+            }
+            if last_prompt {
+                params["source"] = json!("last_prompt");
             }
             let result = channel.request("read_pane_output", params).await?;
             if json_mode {
