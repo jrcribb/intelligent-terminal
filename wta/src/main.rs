@@ -1,4 +1,5 @@
 mod agent_registry;
+mod agent_sessions;
 mod app;
 mod coordinator;
 mod event;
