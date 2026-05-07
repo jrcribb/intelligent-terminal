@@ -4,7 +4,6 @@ mod coordinator;
 mod event;
 mod logging;
 mod osc52;
-mod preflight;
 mod protocol;
 mod runtime_paths;
 mod shared_host;
@@ -48,6 +47,13 @@ struct Cli {
     /// Agent CLI command (e.g. "copilot --acp --stdio")
     #[arg(long, default_value = agent_registry::DEFAULT_ACP_COMMAND)]
     agent: String,
+
+    /// Model override for the ACP agent. Sent via ACP setSessionModel after
+    /// handshake. Used by adapter-style launches (claude, codex via npx)
+    /// where the model can't be passed on the command line; native ACP
+    /// agents (copilot, gemini) use their own --model flag in `agent`.
+    #[arg(long)]
+    acp_model: Option<String>,
 
     /// Delegate agent CLI command (e.g. "codex")
     #[arg(long)]
@@ -1366,10 +1372,6 @@ async fn run_attach_tui(
 
     let autofix_enabled = !no_autofix;
 
-    // ── Preflight: check agent CLI before connecting to shared host ──
-    let preflight_result = preflight::check_agent(&agent).await;
-    let start_in_setup = !preflight_result.all_passed();
-
     // Set up the TUI.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1443,20 +1445,18 @@ async fn run_attach_tui(
             // Spawn the attach client (replaces run_acp_client in shared mode).
             // In attach mode, all prompts/recommendations/permissions are forwarded
             // to the shared host — no local ACP client or recommendation executor.
-            if !start_in_setup {
-                let attach_event_tx = event_tx.clone();
-                tokio::task::spawn_local(shared_host::run_attach_client(
-                    host_pipe_name.clone(),
-                    attach_event_tx,
-                    prompt_rx,
-                    recommendation_rx,
-                    permission_rx,
-                    dismiss_autofix_rx,
-                    pane_context.clone(),
-                    initial_prompt.clone(),
-                    debug_capture_enabled.clone(),
-                ));
-            }
+            let attach_event_tx = event_tx.clone();
+            tokio::task::spawn_local(shared_host::run_attach_client(
+                host_pipe_name.clone(),
+                attach_event_tx,
+                prompt_rx,
+                recommendation_rx,
+                permission_rx,
+                dismiss_autofix_rx,
+                pane_context.clone(),
+                initial_prompt.clone(),
+                debug_capture_enabled.clone(),
+            ));
 
             let (_ui_event_tx, ui_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -1469,12 +1469,6 @@ async fn run_attach_tui(
                 autofix_enabled,
             );
             let _ = dismiss_autofix_tx; // was used for shared_mode dismiss; no longer needed
-
-            // If preflight failed, enter Setup mode with static guidance
-            // (no retry — user must close and reopen the agent pane).
-            if start_in_setup {
-                let _ = event_tx.send(app::AppEvent::PreflightComplete(preflight_result.clone()));
-            }
 
             if let Some((pane_id, tab_id, window_id)) = pane_identity {
                 app_state.pane_id = Some(pane_id);
@@ -1854,70 +1848,19 @@ async fn run_acp_app(
                 });
             }
 
-            // ── Preflight: check agent CLI availability before launching ──
-            let preflight_result = preflight::check_agent(&agent_cmd).await;
-            let start_in_setup = !preflight_result.all_passed();
-
             let shell_mgr_for_recs = Arc::clone(&shell_mgr);
 
-            // Onboarding install request channel: the App fires this when the user
-            // chooses "Install via winget" from the setup wizard.
-            let (install_req_tx, mut install_req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-            // Single task owns prompt_rx and decides when to spawn the ACP client:
-            // either now (preflight passed) or later (after a successful install).
-            let spawn_event_tx = event_tx.clone();
-            let spawn_shell_mgr = Arc::clone(&shell_mgr);
-            let spawn_agent_cmd = agent_cmd.clone();
-            tokio::task::spawn_local(async move {
-                let mut prompt_rx_opt = Some(prompt_rx);
-                let mut spawned = false;
-
-                if !start_in_setup {
-                    if let Some(rx) = prompt_rx_opt.take() {
-                        tokio::task::spawn_local(protocol::acp::client::run_acp_client(
-                            spawn_agent_cmd.clone(),
-                            spawn_event_tx.clone(),
-                            rx,
-                            Arc::clone(&spawn_shell_mgr),
-                            wt_connected,
-                        ));
-                        spawned = true;
-                    }
-                }
-
-                while let Some(()) = install_req_rx.recv().await {
-                    let _ = spawn_event_tx.send(app::AppEvent::InstallStarted);
-                    let progress_tx = spawn_event_tx.clone();
-                    let result = preflight::winget_install_copilot(move |line| {
-                        let _ = progress_tx.send(app::AppEvent::InstallProgress(line));
-                    })
-                    .await;
-                    let _ = spawn_event_tx
-                        .send(app::AppEvent::InstallComplete(result.clone()));
-
-                    if result.is_ok() && !spawned {
-                        // PATH was refreshed inside winget_install_copilot; rerun preflight.
-                        let new_pf = preflight::check_agent(&spawn_agent_cmd).await;
-                        let all_passed = new_pf.all_passed();
-                        let _ = spawn_event_tx
-                            .send(app::AppEvent::PreflightComplete(new_pf));
-
-                        if all_passed {
-                            if let Some(rx) = prompt_rx_opt.take() {
-                                tokio::task::spawn_local(protocol::acp::client::run_acp_client(
-                                    spawn_agent_cmd.clone(),
-                                    spawn_event_tx.clone(),
-                                    rx,
-                                    Arc::clone(&spawn_shell_mgr),
-                                    wt_connected,
-                                ));
-                                spawned = true;
-                            }
-                        }
-                    }
-                }
-            });
+            // Spawn the ACP client directly. If the agent isn't installed or
+            // fails to authenticate, the error surfaces inline as a Failed
+            // connection state — no FRE / setup wizard.
+            tokio::task::spawn_local(protocol::acp::client::run_acp_client(
+                agent_cmd.clone(),
+                cli.acp_model.clone(),
+                event_tx.clone(),
+                prompt_rx,
+                Arc::clone(&shell_mgr),
+                wt_connected,
+            ));
 
             let (recommendation_tx, recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
             let (permission_tx, _permission_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1940,12 +1883,6 @@ async fn run_acp_app(
 
             let autofix_enabled = !cli.no_autofix;
             let mut app_state = app::App::new(prompt_tx, recommendation_tx, permission_tx, debug_capture_enabled, wt_connected, autofix_enabled);
-            app_state.set_install_request_tx(install_req_tx);
-
-            // If preflight failed, start in Setup mode
-            if start_in_setup {
-                let _ = event_tx.send(app::AppEvent::PreflightComplete(preflight_result));
-            }
 
             if let Some((pane_id, tab_id, window_id)) = pane_identity {
                 app_state.pane_id = Some(pane_id);

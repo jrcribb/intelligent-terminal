@@ -216,6 +216,7 @@ impl SharedUiEvent {
                 model,
                 version,
                 session_id,
+                ..
             } => Some(Self::AgentConnected {
                 name: name.clone(),
                 model: model.clone(),
@@ -279,11 +280,7 @@ impl SharedUiEvent {
             | AppEvent::DebugPipeMessage(_)
             | AppEvent::SharedStateSnapshot(_)
             | AppEvent::SharedPermissionRequest { .. }
-            | AppEvent::PermissionCleared
-            | AppEvent::PreflightComplete(_)
-            | AppEvent::InstallStarted
-            | AppEvent::InstallProgress(_)
-            | AppEvent::InstallComplete(_) => None,
+            | AppEvent::PermissionCleared => None,
             AppEvent::UserMessage(_) | AppEvent::MouseScroll { .. } => None,
         }
     }
@@ -302,6 +299,8 @@ impl SharedUiEvent {
                 model,
                 version,
                 session_id,
+                available_models: Vec::new(),
+                current_model_id: None,
             },
             Self::PromptTemplateLoaded { name } => AppEvent::PromptTemplateLoaded { name },
             Self::AgentError { message } => AppEvent::AgentError(message),
@@ -645,6 +644,7 @@ pub async fn run_host_server(
     // client.
     tokio::task::spawn_local(run_acp_client(
         agent_cmd,
+        None,
         event_tx.clone(),
         prompt_rx,
         shell_mgr,
@@ -1855,6 +1855,7 @@ impl HostSessionState {
                 model,
                 version,
                 session_id,
+                ..
             } => {
                 self.agent_name = name;
                 self.agent_model = model;
@@ -1969,10 +1970,6 @@ impl HostSessionState {
             | AppEvent::UserMessage(_)
             | AppEvent::SharedPermissionRequest { .. }
             | AppEvent::PermissionCleared
-            | AppEvent::PreflightComplete(_)
-            | AppEvent::InstallStarted
-            | AppEvent::InstallProgress(_)
-            | AppEvent::InstallComplete(_)
             | AppEvent::Tick
             | AppEvent::Key(_)
             | AppEvent::MouseScroll { .. }

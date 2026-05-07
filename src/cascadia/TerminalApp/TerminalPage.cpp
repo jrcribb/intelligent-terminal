@@ -906,8 +906,22 @@ namespace winrt::TerminalApp::implementation
         }
 
         // Built-in agents: append known ACP flags + model.
-        std::wstring cmd{ acpAgent };
         const auto lower = winrt::to_string(acpAgent);
+
+        // Adapter-style launches: claude/codex CLIs don't speak ACP themselves.
+        // We invoke the npm adapter via npx; the npm-installed claude/codex
+        // shim implies node/npx are present. Model is sent via ACP
+        // setSessionModel after handshake, not on the command line.
+        if (lower == "claude")
+        {
+            return winrt::hstring{ L"npx -y @zed-industries/claude-code-acp" };
+        }
+        if (lower == "codex")
+        {
+            return winrt::hstring{ L"npx -y @zed-industries/codex-acp" };
+        }
+
+        std::wstring cmd{ acpAgent };
         if (lower == "copilot")
         {
             cmd += L" --acp --stdio";
@@ -1151,6 +1165,20 @@ namespace winrt::TerminalApp::implementation
             cmdline += fmt::format(FMT_COMPILE(L" --delegate-model \"{}\""), s);
         }
 
+        // Pass the ACP model selection out-of-band so it works for adapter
+        // launches (claude/codex via npx) where --model can't be put on the
+        // adapter cmdline. wta sends this via ACP setSessionModel after
+        // handshake; for copilot/gemini it's redundant (their --model is
+        // already on the agent cmdline) but harmless.
+        const auto acpModel = globals.AcpModel();
+        if (!acpModel.empty())
+        {
+            std::wstring s{ acpModel };
+            for (size_t pos = 0; (pos = s.find(L'"', pos)) != std::wstring::npos; pos += 2)
+                s.replace(pos, 1, L"\"\"");
+            cmdline += fmt::format(FMT_COMPILE(L" --acp-model \"{}\""), s);
+        }
+
         if (!globals.AutoFixEnabled())
         {
             cmdline += L" --no-autofix";
@@ -1353,24 +1381,47 @@ namespace winrt::TerminalApp::implementation
 
         _agentPaneLog("_RebuildAgentStack: agent settings changed, rebuilding");
 
-        // Remember whether the pane was visible before teardown.
-        bool hadVisiblePane = false;
-        if (const auto existingPane = _FindAgentPane())
+        // Remember the pane and the tab that owns it BEFORE teardown.
+        // Settings changes are typically authored from the Settings tab, so
+        // _GetFocusedTabImpl() points at Settings — we must not recreate the
+        // agent pane there. If no pane exists yet, just snapshot and bail —
+        // the user gets a fresh pane next time they open one.
+        const auto existingPane = _FindAgentPane();
+        if (!existingPane)
         {
-            hadVisiblePane = !existingPane->IsHidden();
+            _lastAgentSettings = current;
+            _agentPaneLog("_RebuildAgentStack: no existing agent pane, snapshot only");
+            return;
         }
+        const bool hadVisiblePane = !existingPane->IsHidden();
+        const auto ownerTab = _FindTabContainingAgentPane();
 
         _TeardownAgentPane();
         _lastAgentSettings = current;
 
-        // Recreate the hidden pane under the new settings, then restore visibility.
-        if (auto tab = _GetFocusedTabImpl())
+        // Recreate the hidden pane on the original tab — never on whatever
+        // happens to be focused (often Settings during a model switch).
+        if (ownerTab)
         {
-            _AutoCreateHiddenAgentPane(tab);
+            _AutoCreateHiddenAgentPane(ownerTab);
         }
-        if (hadVisiblePane)
+        // If the pane was visible before the rebuild, restore it on the
+        // *owner* tab. Going through _OpenOrReuseAgentPane would drag the
+        // pane onto the currently focused tab (Settings, when the rebuild
+        // is triggered by a model switch), which is what we just fixed.
+        if (hadVisiblePane && ownerTab)
         {
-            _OpenOrReuseAgentPane(L"");
+            if (const auto newPane = _FindAgentPane())
+            {
+                if (const auto newRoot = ownerTab->GetRootPane())
+                {
+                    newRoot->RestorePane(newPane);
+                    if (const auto paneId = newPane->Id())
+                    {
+                        ownerTab->FocusPane(paneId.value());
+                    }
+                }
+            }
         }
         _UpdateBottomBarState();
     }
@@ -3233,6 +3284,56 @@ namespace winrt::TerminalApp::implementation
         const auto version = pickStr("version");
         const auto model = pickStr("model");
         const auto state = pickStr("state");
+
+        _agentPaneLog("OnAgentStatusChanged: payload=" + winrt::to_string(eventJson).substr(0, 600));
+
+        // Sync the process-wide model-list cache. The Settings UI's
+        // AIAgentsViewModel reads from this on construction, so any new
+        // dropdown opened after this point sees the freshest list.
+        if (params.isMember("available_models") && params["available_models"].isArray())
+        {
+            _agentPaneLog("OnAgentStatusChanged: available_models has " +
+                          std::to_string(params["available_models"].size()) + " entries");
+            std::vector<winrt::Microsoft::Terminal::Settings::Model::AcpModelInfo> entries;
+            for (const auto& m : params["available_models"])
+            {
+                if (!m.isObject())
+                {
+                    continue;
+                }
+                winrt::hstring id;
+                winrt::hstring name;
+                winrt::hstring description;
+                if (m.isMember("id") && m["id"].isString())
+                {
+                    id = winrt::to_hstring(m["id"].asString());
+                }
+                if (m.isMember("name") && m["name"].isString())
+                {
+                    name = winrt::to_hstring(m["name"].asString());
+                }
+                if (m.isMember("description") && m["description"].isString())
+                {
+                    description = winrt::to_hstring(m["description"].asString());
+                }
+                if (!id.empty())
+                {
+                    entries.push_back(winrt::Microsoft::Terminal::Settings::Model::AcpModelInfo{
+                        id,
+                        name.empty() ? id : name,
+                        description });
+                }
+            }
+            winrt::hstring currentId;
+            if (params.isMember("current_model_id") && params["current_model_id"].isString())
+            {
+                currentId = winrt::to_hstring(params["current_model_id"].asString());
+            }
+            winrt::Microsoft::Terminal::Settings::Model::AcpRuntimeState::Current()
+                .SetAvailableModels(
+                    winrt::single_threaded_vector(std::move(entries)).GetView(),
+                    currentId);
+        }
 
         const auto agentPane = _FindAgentPane();
         if (!agentPane)

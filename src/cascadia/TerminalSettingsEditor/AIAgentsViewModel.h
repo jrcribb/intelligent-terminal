@@ -4,6 +4,7 @@
 #pragma once
 
 #include "AIAgentsViewModel.g.h"
+#include "AcpModelEntry.g.h"
 #include "AgentEntry.g.h"
 #include "ViewModelHelpers.h"
 #include "Utils.h"
@@ -29,10 +30,30 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
         bool _isAddNew{ false };
     };
 
+    struct AcpModelEntry : AcpModelEntryT<AcpModelEntry>
+    {
+        AcpModelEntry(winrt::hstring id, winrt::hstring displayName, winrt::hstring description) :
+            _id{ std::move(id) },
+            _displayName{ std::move(displayName) },
+            _description{ std::move(description) }
+        {
+        }
+
+        winrt::hstring Id() const { return _id; }
+        winrt::hstring DisplayName() const { return _displayName; }
+        winrt::hstring Description() const { return _description; }
+
+    private:
+        winrt::hstring _id;
+        winrt::hstring _displayName;
+        winrt::hstring _description;
+    };
+
     struct AIAgentsViewModel : AIAgentsViewModelT<AIAgentsViewModel>, ViewModelHelper<AIAgentsViewModel>
     {
     public:
         AIAgentsViewModel(Model::GlobalAppSettings globalSettings);
+        ~AIAgentsViewModel();
 
         using ViewModelHelper<AIAgentsViewModel>::PropertyChanged;
 
@@ -69,6 +90,11 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
         void DeleteCustomDelegateAgent();
 
         bool ShowAcpModel();
+        winrt::Windows::Foundation::Collections::IObservableVector<Editor::AcpModelEntry> AcpModelList() const { return _acpModelList; }
+        bool HasAcpModelList() const { return _acpModelList && _acpModelList.Size() > 0; }
+        bool ShowAcpModelTextBox() const { return !HasAcpModelList(); }
+        Editor::AcpModelEntry CurrentAcpModelEntry();
+        void CurrentAcpModelEntry(const Editor::AcpModelEntry& value);
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, AcpModel);
         bool ShowDelegateModel();
         PERMANENT_OBSERVABLE_PROJECTED_SETTING(_GlobalSettings, DelegateModel);
@@ -86,6 +112,7 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
         Model::GlobalAppSettings _GlobalSettings;
         winrt::Windows::Foundation::Collections::IObservableVector<Editor::AgentEntry> _acpAgentList;
         winrt::Windows::Foundation::Collections::IObservableVector<Editor::AgentEntry> _delegateAgentList;
+        winrt::Windows::Foundation::Collections::IObservableVector<Editor::AcpModelEntry> _acpModelList;
 
         winrt::Windows::Foundation::Collections::IObservableVector<winrt::Microsoft::Terminal::Settings::Editor::EnumEntry> _agentPanePositionList;
         winrt::Windows::Foundation::Collections::IMap<winrt::hstring, winrt::Microsoft::Terminal::Settings::Editor::EnumEntry> _agentPanePositionMap;
@@ -94,6 +121,9 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::implementation
         bool _isAddingCustomDelegateAgent{ false };
         winrt::hstring _customAcpCommand;
         winrt::hstring _customDelegateCommand;
+
+        winrt::event_token _acpRuntimeChangedToken{};
+        void _RebuildAcpModelListFromCache();
 
         static bool _IsAgentInstalled(const wchar_t* name);
         static bool _IsKnownAgent(const winrt::hstring& id);
@@ -114,4 +144,5 @@ namespace winrt::Microsoft::Terminal::Settings::Editor::factory_implementation
 {
     BASIC_FACTORY(AIAgentsViewModel);
     BASIC_FACTORY(AgentEntry);
+    BASIC_FACTORY(AcpModelEntry);
 }

@@ -923,9 +923,9 @@ async fn build_prompt_text(
             );
         }
     } else {
-        // Auto-fix prompt: only read the source pane buffer, no layout.
-        // Prefer shell-integration mark slicing — falls back to a 30-line read
-        // when shell integration is unavailable.
+        // Auto-fix prompt: read the source pane buffer + a small shell-context
+        // header so the agent can choose PowerShell vs bash vs cmd syntax for
+        // any file-edit fix it suggests.
         if wt_connected {
             if let Some(source_pane_id) = pane_context
                 .and_then(|ctx| ctx.effective_source_pane_id())
@@ -936,6 +936,40 @@ async fn build_prompt_text(
                     mode = "autofix",
                     "terminal_context_target_resolved"
                 );
+
+                // Shell context — best-effort. WT returns the profile name
+                // (e.g. "PowerShell", "Command Prompt", "Ubuntu") which is a
+                // strong signal even when the user has renamed the profile.
+                if let Ok(active) = shell_mgr.wt_get_active_pane().await {
+                    let profile = active
+                        .get("profile")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let cwd = active
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let platform = if cfg!(target_os = "windows") {
+                        "windows"
+                    } else if cfg!(target_os = "macos") {
+                        "macos"
+                    } else {
+                        "linux"
+                    };
+                    let json = serde_json::to_string(&serde_json::json!({
+                        "platform": platform,
+                        "profile": profile,
+                        "cwd": cwd,
+                    }))
+                    .unwrap_or_else(|_| "{}".to_string());
+                    runtime_sections.push(format!(
+                        "### Shell Context\n```json\n{}\n```",
+                        json
+                    ));
+                }
+
                 if let Some(content) = read_pane_last_message(
                     shell_mgr,
                     source_pane_id,
@@ -1352,6 +1386,7 @@ impl acp::Client for WtaClient {
 /// Top-level ACP client task: spawn agent, handshake, prompt loop.
 pub async fn run_acp_client(
     agent_cmd: String,
+    acp_model_override: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     mut prompt_rx: mpsc::UnboundedReceiver<PromptSubmission>,
     shell_mgr: Arc<ShellManager>,
@@ -1359,12 +1394,13 @@ pub async fn run_acp_client(
 ) {
     let startup_probe = StartupProbe::new();
     startup_probe.log(&format!(
-        "run_acp_client task start agent_cmd={} wt_connected={}",
-        agent_cmd, wt_connected
+        "run_acp_client task start agent_cmd={} acp_model={:?} wt_connected={}",
+        agent_cmd, acp_model_override, wt_connected
     ));
     startup_probe.log("run_acp_client entering run_inner");
     if let Err(e) = run_inner(
         agent_cmd,
+        acp_model_override,
         event_tx.clone(),
         &mut prompt_rx,
         shell_mgr,
@@ -1381,6 +1417,7 @@ pub async fn run_acp_client(
 
 async fn run_inner(
     agent_cmd: String,
+    acp_model_override: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptSubmission>,
     shell_mgr: Arc<ShellManager>,
@@ -1401,7 +1438,21 @@ async fn run_inner(
 
     // Spawn agent subprocess
     let program = if needs_cmd { "cmd" } else { resolved_program.as_str() };
-    let spawn_stage = format!("Spawning {}...", resolved_program);
+    // For adapter-style launches (npx -y @zed/...-acp), surface a more
+    // accurate stage hint — first run downloads the package (~10s).
+    let spawn_stage = if resolved_program.eq_ignore_ascii_case("npx")
+        || resolved_program.eq_ignore_ascii_case("npx.cmd")
+        || resolved_program.eq_ignore_ascii_case("npx.exe")
+    {
+        let adapter = args
+            .iter()
+            .find(|a| a.starts_with('@'))
+            .copied()
+            .unwrap_or("agent");
+        format!("Setting up {} (first run downloads adapter, ~10s)…", adapter)
+    } else {
+        format!("Spawning {}...", resolved_program)
+    };
     let _ = event_tx.send(AppEvent::ConnectionStage(spawn_stage.clone()));
     startup_probe.log(&format!("{} cmd={} resolved={} needs_cmd={}", spawn_stage, agent_cmd, resolved_program, needs_cmd));
 
@@ -1507,12 +1558,36 @@ async fn run_inner(
                     .title("Windows Terminal Agent"),
             ),
     );
-    let init_resp = tokio::time::timeout(std::time::Duration::from_secs(15), init_future)
+    // npx-launched adapters need a generous window because the first run
+    // downloads the package (~5MB, can take 20–30s on slow links). Native
+    // ACP CLIs respond in <1s, so the longer timeout has zero cost on the
+    // hot path — it only matters when a download is actually happening.
+    let is_npx_launch = resolved_program.eq_ignore_ascii_case("npx")
+        || resolved_program.eq_ignore_ascii_case("npx.cmd")
+        || resolved_program.eq_ignore_ascii_case("npx.exe");
+    let init_timeout_secs = if is_npx_launch { 60 } else { 15 };
+    // Pick a friendly name for error reporting. For npx launches the
+    // first @-prefixed arg is the adapter package; otherwise use the
+    // resolved program path.
+    let agent_label: String = if is_npx_launch {
+        args.iter()
+            .find(|a| a.starts_with('@'))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| raw_program.to_string())
+    } else {
+        raw_program.to_string()
+    };
+    let init_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(init_timeout_secs),
+        init_future,
+    )
         .await
         .map_err(|_| anyhow::anyhow!(
-            "ACP initialize timed out after 15 s — '{}' may not support the ACP protocol. \
-             Only ACP-capable agents (e.g. copilot, gemini) can be used as the ACP agent.",
-            raw_program
+            "ACP initialize timed out after {} s — '{}' did not respond. \
+             First-run npx adapters download ~5MB; check network. \
+             Built-in ACP agents: copilot, claude (via @zed-industries/claude-code-acp), \
+             codex (via @zed-industries/codex-acp), gemini.",
+            init_timeout_secs, agent_label
         ))?
         .map_err(|e| anyhow::anyhow!("initialize failed: {}", e))?;
 
@@ -1533,7 +1608,43 @@ async fn run_inner(
     let session_id = session.session_id.clone();
     startup_probe.log(&format!("Session created: {}", session_id));
 
-    if let Some(requested_model) = requested_model_id(raw_program, args) {
+    // Capture the agent's advertised model list. Settings UI rebuilds its
+    // ComboBox from the `agent_status` event payload, where this gets
+    // forwarded by App::publish_agent_status.
+    let (available_models, current_model_id) = match &session.models {
+        Some(state) => {
+            startup_probe.log(&format!(
+                "Session models: agent advertised {} model(s), current={}",
+                state.available_models.len(),
+                state.current_model_id.0,
+            ));
+            let models: Vec<crate::app::AcpModelInfo> = state
+                .available_models
+                .iter()
+                .map(|m| crate::app::AcpModelInfo {
+                    id: m.model_id.0.to_string(),
+                    name: m.name.clone(),
+                    description: m.description.clone(),
+                })
+                .collect();
+            (models, Some(state.current_model_id.0.to_string()))
+        }
+        None => {
+            startup_probe.log(
+                "Session models: agent did not advertise any models (NewSessionResponse.models is None)",
+            );
+            (Vec::new(), None)
+        }
+    };
+
+    // Resolve the model to apply: explicit `--acp-model` flag wins (used by
+    // adapters like claude/codex via npx that can't carry --model on the
+    // adapter cmdline), else fall back to extracting from the agent's own
+    // `--model X` flag (copilot, gemini).
+    let requested_model = acp_model_override
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| requested_model_id(raw_program, args));
+    if let Some(requested_model) = requested_model {
         let _ = event_tx.send(AppEvent::ConnectionStage(format!(
             "Selecting model {}...",
             requested_model
@@ -1571,6 +1682,8 @@ async fn run_inner(
         model: agent_model,
         version: agent_version,
         session_id: session_id.to_string(),
+        available_models,
+        current_model_id,
     });
 
     // Prompt loop: wait for user input, send to agent

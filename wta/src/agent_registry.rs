@@ -40,8 +40,14 @@ pub struct AgentProfile {
 
     // ── ACP server mode ──
     /// Flags that put this agent into ACP mode (e.g. `["--acp", "--stdio"]`).
-    /// Empty slice means the agent does not support ACP.
+    /// Empty slice means the agent's own CLI does not speak ACP — but
+    /// `acp_launch_command` may still provide a wrapper that does.
     pub acp_flags: &'static [&'static str],
+    /// Override command for ACP mode. When non-empty, this is the full
+    /// commandline used to spawn the ACP server (e.g.
+    /// `"npx -y @zed-industries/claude-code-acp"` for an adapter package).
+    /// When empty, `build_acp_command` falls back to `id + acp_flags`.
+    pub acp_launch_command: &'static str,
     /// Authentication flow required for ACP sessions.
     pub acp_auth_flow: AcpAuthFlow,
 
@@ -73,6 +79,7 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
         display_name: "GitHub Copilot",
         exe_search_order: &[".exe", ".cmd"],
         acp_flags: &["--acp", "--stdio"],
+        acp_launch_command: "",
         acp_auth_flow: AcpAuthFlow::External,
         delegate_prompt_flag: PromptFlag::Flag("-i"),
         model_flags: &["--model", "-m"],
@@ -86,7 +93,11 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
         display_name: "Claude",
         exe_search_order: &[".exe", ".cmd"],
         acp_flags: &[],
-        acp_auth_flow: AcpAuthFlow::None,
+        // Claude CLI itself doesn't speak ACP. We launch the Zed-maintained
+        // adapter via npx; npm-installed `claude` shim implies node/npx
+        // are present, so this works whenever delegate mode does.
+        acp_launch_command: "npx -y @zed-industries/claude-code-acp",
+        acp_auth_flow: AcpAuthFlow::External,
         delegate_prompt_flag: PromptFlag::Positional,
         model_flags: &[],
         install_hint: "npm install -g @anthropic-ai/claude-code",
@@ -99,19 +110,22 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
         display_name: "Codex",
         exe_search_order: &[".exe", ".cmd"],
         acp_flags: &[],
-        acp_auth_flow: AcpAuthFlow::None,
+        // Codex CLI itself doesn't speak ACP. Same npx-adapter pattern as Claude.
+        acp_launch_command: "npx -y @zed-industries/codex-acp",
+        acp_auth_flow: AcpAuthFlow::External,
         delegate_prompt_flag: PromptFlag::Positional,
         model_flags: &[],
         install_hint: "npm install -g @openai/codex",
         install_url: "https://github.com/openai/codex",
         auth_check_command: "",
-        auth_hint: "Run: codex auth",
+        auth_hint: "Run: codex auth (or set OPENAI_API_KEY)",
     },
     AgentProfile {
         id: "gemini",
         display_name: "Gemini",
         exe_search_order: &[".exe", ".cmd"],
         acp_flags: &["--experimental-acp"],
+        acp_launch_command: "",
         acp_auth_flow: AcpAuthFlow::InProtocol,
         delegate_prompt_flag: PromptFlag::Positional,
         model_flags: &["--model", "-m"],
@@ -127,6 +141,7 @@ pub const DEFAULT_PROFILE: AgentProfile = AgentProfile {
     display_name: "Agent",
     exe_search_order: &[".exe", ".cmd"],
     acp_flags: &[],
+    acp_launch_command: "",
     acp_auth_flow: AcpAuthFlow::None,
     delegate_prompt_flag: PromptFlag::Flag("-i"),
     model_flags: &["--model", "-m"],
@@ -172,8 +187,20 @@ pub fn lookup_profile_by_id(id: &str) -> &'static AgentProfile {
 
 /// Build the full ACP agent command from an agent id and optional model.
 /// E.g. `build_acp_command("copilot", Some("gpt-5"))` → `"copilot --acp --stdio --model gpt-5"`.
+/// For agents whose CLI doesn't speak ACP natively (claude, codex), this
+/// returns the adapter launch command instead — e.g.
+/// `build_acp_command("claude", None)` → `"npx -y @zed-industries/claude-code-acp"`.
 pub fn build_acp_command(agent_id: &str, model: Option<&str>) -> String {
     let profile = lookup_profile_by_id(agent_id);
+
+    // Adapter-style launch (e.g. claude, codex via npx). The adapter doesn't
+    // accept --model on the command line — model is sent via ACP setSessionModel
+    // after handshake — so we ignore the `model` arg here.
+    if !profile.acp_launch_command.is_empty() {
+        let _ = model;
+        return profile.acp_launch_command.to_string();
+    }
+
     let mut parts = vec![agent_id.to_string()];
     for flag in profile.acp_flags {
         parts.push(flag.to_string());
@@ -192,9 +219,24 @@ pub fn build_acp_command(agent_id: &str, model: Option<&str>) -> String {
 /// Given an ACP agent commandline like `"copilot --acp --stdio --model gpt-5"`,
 /// strip ACP-specific flags to produce a clean delegate commandline,
 /// preserving model flags.  Returns `None` if the command is not a known ACP agent.
+///
+/// For adapter-style launches (e.g. `"npx -y @zed-industries/claude-code-acp"`),
+/// returns the bare agent id (e.g. `"claude"`) — delegate mode invokes the
+/// agent's own CLI directly, not the ACP adapter.
 pub fn strip_acp_flags_for_delegate(agent_cmd: &str) -> Option<String> {
     let tokens = crate::coordinator::split_windows_commandline(agent_cmd);
     let command = tokens.first()?;
+
+    // Adapter-style: input is something like "npx -y @zed/claude-code-acp".
+    // Find which agent owns this launch command and return its bare id.
+    let trimmed = agent_cmd.trim();
+    if let Some(profile) = KNOWN_AGENTS
+        .iter()
+        .find(|p| !p.acp_launch_command.is_empty() && p.acp_launch_command == trimmed)
+    {
+        return Some(profile.id.to_string());
+    }
+
     let profile = lookup_profile(command);
     if profile.acp_flags.is_empty() {
         return None; // Not an ACP agent, nothing to strip.

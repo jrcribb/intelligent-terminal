@@ -1,15 +1,10 @@
 use ratatui::prelude::*;
-use crate::app::{App, AppMode};
+use crate::app::App;
 
-use super::{chat, debug_panel, input, permission, recommendations, setup};
+use super::{chat, debug_panel, input, permission, recommendations};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
-
-    if app.mode == AppMode::Setup {
-        setup::render(frame, app, area);
-        return;
-    }
 
     let (main_area, debug_area) = if app.show_debug_panel {
         let h = Layout::default()
@@ -63,10 +58,6 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
-    if app.mode == AppMode::Setup {
-        return None;
-    }
-
     let main_area = if app.show_debug_panel {
         Layout::default()
             .direction(Direction::Horizontal)

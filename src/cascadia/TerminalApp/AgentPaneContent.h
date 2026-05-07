@@ -69,6 +69,7 @@ namespace winrt::TerminalApp::implementation
         void _unwireInnerEvents();
 
         void _refreshLabel();
+        void _refreshLogo();
     };
 }
 

@@ -14,7 +14,6 @@ use crate::coordinator::{
     validate_recommendation_set_for_coordinator_target, AutofixDecision, RecommendationChoice,
     RecommendationSet,
 };
-use crate::preflight::{CheckStatus, PreflightResult};
 use crate::protocol::acp::client::{prompt_timing_log, PromptSubmission};
 use crate::shared_host::SharedStateSnapshot;
 use crate::ui;
@@ -91,31 +90,6 @@ pub struct PermissionState {
     pub options: Vec<PermOption>,
     pub selected: usize,
     pub responder: Option<tokio::sync::oneshot::Sender<String>>,
-}
-
-// --- Setup / OOBE ---
-
-/// Application mode — controls which UI is shown.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AppMode {
-    /// Normal agent chat.
-    Chat,
-    /// Setup wizard (agent not ready — CLI missing or not authenticated).
-    Setup,
-}
-
-/// State for the setup wizard screen.
-#[derive(Debug, Clone)]
-pub struct SetupState {
-    pub preflight: PreflightResult,
-    /// Which check row is currently selected (0 = CLI, 1 = Auth).
-    pub selected_index: usize,
-    /// True while a `winget install` task is running.
-    pub install_in_progress: bool,
-    /// Tail of the install command's output (last ~6 lines).
-    pub install_log: Vec<String>,
-    /// Error message from the most recent install attempt (cleared on retry).
-    pub install_error: Option<String>,
 }
 
 // --- WT Event Notification ---
@@ -270,6 +244,17 @@ enum FinalizeOutcome {
 
 // --- Events ---
 
+/// One entry of an ACP agent's advertised model list, mirrored into the
+/// `agent_status` event so the XAML settings page can populate a real
+/// dropdown instead of asking the user to type a free-form string.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AcpModelInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 pub enum AppEvent {
     Key(KeyEvent),
     /// Mouse wheel scroll: delta<0 = scroll up, delta>0 = scroll down, row = terminal row of event
@@ -284,6 +269,11 @@ pub enum AppEvent {
         model: Option<String>,
         version: Option<String>,
         session_id: String,
+        /// ACP-advertised models (NewSessionResponse.models.available_models).
+        /// Empty when the agent didn't fill the field.
+        available_models: Vec<AcpModelInfo>,
+        /// ACP-advertised current model id (NewSessionResponse.models.current_model_id).
+        current_model_id: Option<String>,
     },
     PromptTemplateLoaded {
         name: String,
@@ -323,14 +313,6 @@ pub enum AppEvent {
         pane_id: String,
         params: serde_json::Value,
     },
-    /// Preflight checks completed — transition from Setup to Chat if all passed.
-    PreflightComplete(PreflightResult),
-    /// Onboarding install: install task started.
-    InstallStarted,
-    /// Onboarding install: a line of stdout/stderr from winget.
-    InstallProgress(String),
-    /// Onboarding install: install task finished. Ok = success, Err = error message.
-    InstallComplete(Result<(), String>),
 }
 
 // --- Per-tab session storage ---
@@ -347,12 +329,15 @@ struct TabSession {
 // --- App ---
 
 pub struct App {
-    pub mode: AppMode,
-    pub setup: Option<SetupState>,
     pub state: ConnectionState,
     pub agent_name: String,
     pub agent_model: Option<String>,
     pub agent_version: Option<String>,
+    /// Models the ACP agent advertised at session start. Empty until the
+    /// first AgentConnected event with non-empty data; published into the
+    /// `agent_status` event so the settings UI can render a dropdown.
+    pub available_models: Vec<AcpModelInfo>,
+    pub current_model_id: Option<String>,
     pub prompt_name: Option<String>,
     pub progress_status: Option<String>,
     pub activity_frame: usize,
@@ -414,8 +399,6 @@ pub struct App {
     inflight_autofix_generation: Option<u64>,
     // Per-tab conversation sessions. Keyed by tab_id string (0-based index).
     tab_sessions: HashMap<String, TabSession>,
-    // Onboarding: signals main.rs to spawn `winget install GitHub.Copilot`.
-    install_request_tx: Option<mpsc::UnboundedSender<()>>,
 }
 
 impl App {
@@ -428,12 +411,12 @@ impl App {
         autofix_enabled: bool,
     ) -> Self {
         Self {
-            mode: AppMode::Chat,
-            setup: None,
             state: ConnectionState::Connecting("Starting agent...".to_string()),
             agent_name: String::new(),
             agent_model: None,
             agent_version: None,
+            available_models: Vec::new(),
+            current_model_id: None,
             prompt_name: None,
             progress_status: None,
             activity_frame: 0,
@@ -483,13 +466,7 @@ impl App {
             autofix_generation: 0,
             inflight_autofix_generation: None,
             tab_sessions: HashMap::new(),
-            install_request_tx: None,
         }
-    }
-
-    /// Wire up the channel that signals main.rs to spawn `winget install`.
-    pub fn set_install_request_tx(&mut self, tx: mpsc::UnboundedSender<()>) {
-        self.install_request_tx = Some(tx);
     }
 
     pub async fn run(
@@ -682,10 +659,6 @@ impl App {
             AppEvent::DebugPipeMessage(_) => "debug_pipe_message",
             AppEvent::SharedStateSnapshot(_) => "shared_state_snapshot",
             AppEvent::WtEvent { .. } => "wt_event",
-            AppEvent::PreflightComplete(_) => "preflight_complete",
-            AppEvent::InstallStarted => "install_started",
-            AppEvent::InstallProgress(_) => "install_progress",
-            AppEvent::InstallComplete(_) => "install_complete",
         }
     }
 
@@ -784,11 +757,15 @@ impl App {
                 model,
                 version,
                 session_id,
+                available_models,
+                current_model_id,
             } => {
                 self.agent_name = name;
                 self.agent_model = model;
                 self.agent_version = version;
                 self.session_id = session_id;
+                self.available_models = available_models;
+                self.current_model_id = current_model_id;
                 self.state = ConnectionState::Connected;
                 self.publish_agent_status();
             }
@@ -796,77 +773,17 @@ impl App {
                 self.prompt_name = Some(name);
             }
             AppEvent::AgentError(msg) => {
-                // Check if this is an auth-related error — if so, show the
-                // Setup wizard with CLI ✓ and Auth ✗ instead of a raw error.
-                let lower = msg.to_ascii_lowercase();
-                let is_auth_error = lower.contains("auth")
-                    || lower.contains("login")
-                    || lower.contains("unauthorized")
-                    || lower.contains("401")
-                    || lower.contains("credentials");
-
-                if is_auth_error && self.mode != AppMode::Setup {
-                    // Extract agent id from the agent_name or fall back
-                    let agent_id = if self.agent_name.is_empty() {
-                        "copilot".to_string()
-                    } else {
-                        self.agent_name.to_ascii_lowercase()
-                    };
-                    let profile = crate::agent_registry::lookup_profile(&agent_id);
-
-                    // Build a preflight result with CLI passed, auth failed
-                    let auth_reason = msg
-                        .lines()
-                        .find(|l| {
-                            let ll = l.to_ascii_lowercase();
-                            ll.contains("auth") || ll.contains("login")
-                        })
-                        .unwrap_or("Not authenticated")
-                        .trim()
-                        .to_string();
-
-                    let preflight = PreflightResult {
-                        agent_id: profile.id.to_string(),
-                        display_name: profile.display_name.to_string(),
-                        cli_status: CheckStatus::Passed,
-                        cli_path: None,
-                        auth_status: CheckStatus::Failed(auth_reason),
-                        install_hint: profile.install_hint.to_string(),
-                        install_url: profile.install_url.to_string(),
-                        auth_hint: profile.auth_hint.to_string(),
-                    };
-
-                    self.mode = AppMode::Setup;
-                    self.setup = Some(SetupState {
-                        preflight,
-                        selected_index: 1, // select auth row
-                        install_in_progress: false,
-                        install_log: Vec::new(),
-                        install_error: None,
-                    });
-                    self.state = ConnectionState::Disconnected;
-                    self.publish_agent_status();
-                    self.prompt_in_flight = false;
-                    self.agent_streaming = false;
-                    self.progress_status = None;
-                    self.pending_thought_response.clear();
-                    self.activity_frame = 0;
-                    self.pending_agent_response.clear();
-                    self.timing_note = None;
-                    self.pending_completed_turn = None;
-                } else {
-                    self.state = ConnectionState::Failed(msg.clone());
-                    self.publish_agent_status();
-                    self.prompt_in_flight = false;
-                    self.agent_streaming = false;
-                    self.progress_status = None;
-                    self.pending_thought_response.clear();
-                    self.activity_frame = 0;
-                    self.pending_agent_response.clear();
-                    self.timing_note = None;
-                    self.pending_completed_turn = None;
-                    self.messages.push(ChatMessage::Error(msg));
-                }
+                self.state = ConnectionState::Failed(msg.clone());
+                self.publish_agent_status();
+                self.prompt_in_flight = false;
+                self.agent_streaming = false;
+                self.progress_status = None;
+                self.pending_thought_response.clear();
+                self.activity_frame = 0;
+                self.pending_agent_response.clear();
+                self.timing_note = None;
+                self.pending_completed_turn = None;
+                self.messages.push(ChatMessage::Error(msg));
             }
             AppEvent::ExecutionInfo(message) => {
                 self.push_execution_info(message);
@@ -1129,60 +1046,6 @@ impl App {
                     self.wt_notifications.pop_front();
                 }
             }
-            AppEvent::InstallStarted => {
-                if let Some(ref mut setup) = self.setup {
-                    setup.install_in_progress = true;
-                    setup.install_error = None;
-                }
-            }
-            AppEvent::InstallProgress(line) => {
-                if let Some(ref mut setup) = self.setup {
-                    setup.install_log.push(line);
-                    // Cap to last ~8 lines so the UI doesn't grow unbounded.
-                    let len = setup.install_log.len();
-                    if len > 8 {
-                        setup.install_log.drain(0..len - 8);
-                    }
-                }
-            }
-            AppEvent::InstallComplete(result) => {
-                if let Some(ref mut setup) = self.setup {
-                    setup.install_in_progress = false;
-                    match result {
-                        Ok(()) => {
-                            setup.install_log.push("Installation complete.".to_string());
-                            setup.install_error = None;
-                        }
-                        Err(err) => {
-                            setup.install_error = Some(err);
-                        }
-                    }
-                }
-            }
-            AppEvent::PreflightComplete(result) => {
-                if result.all_passed() {
-                    // All checks passed — transition to Chat mode
-                    self.mode = AppMode::Chat;
-                    self.setup = None;
-                    self.state = ConnectionState::Connecting("Starting agent...".to_string());
-                } else {
-                    // Show the setup wizard. Preserve any install state so the user
-                    // sees the result of a just-finished install attempt.
-                    let (install_log, install_error) = match self.setup.take() {
-                        Some(prev) => (prev.install_log, prev.install_error),
-                        None => (Vec::new(), None),
-                    };
-                    self.mode = AppMode::Setup;
-                    self.setup = Some(SetupState {
-                        preflight: result,
-                        selected_index: 0,
-                        install_in_progress: false,
-                        install_log,
-                        install_error,
-                    });
-                    self.state = ConnectionState::Disconnected;
-                }
-            }
         }
     }
 
@@ -1196,12 +1059,6 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        // If in setup mode, route keys to setup handler
-        if self.mode == AppMode::Setup {
-            self.handle_setup_key(key);
-            return;
-        }
-
         // If permission modal is showing, route keys there
         if let Some(ref mut perm) = self.permission {
             match key.code {
@@ -1492,72 +1349,6 @@ impl App {
         }
     }
 
-    fn handle_setup_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
-            KeyCode::Esc => {
-                self.should_quit = true;
-            }
-            KeyCode::Enter => {
-                // Trigger winget install when the CLI row is selected and CLI is missing.
-                let should_install = self
-                    .setup
-                    .as_ref()
-                    .map(|s| {
-                        s.selected_index == 0
-                            && s.preflight.cli_status != CheckStatus::Passed
-                            && !s.install_in_progress
-                            && s.preflight.agent_id == "copilot"
-                    })
-                    .unwrap_or(false);
-
-                if should_install {
-                    if let Some(tx) = &self.install_request_tx {
-                        let _ = tx.send(());
-                        if let Some(ref mut setup) = self.setup {
-                            setup.install_in_progress = true;
-                            setup.install_error = None;
-                            setup.install_log.clear();
-                            setup
-                                .install_log
-                                .push("Starting GitHub Copilot installation...".to_string());
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('o') | KeyCode::Char('O') => {
-                // Open install page in browser as a fallback.
-                if let Some(ref setup) = self.setup {
-                    if setup.selected_index == 0
-                        && setup.preflight.cli_status != CheckStatus::Passed
-                    {
-                        let url = setup.preflight.install_url.clone();
-                        if !url.is_empty() {
-                            let _ = open_url_in_browser(&url);
-                        }
-                    }
-                }
-            }
-            KeyCode::Up => {
-                if let Some(ref mut setup) = self.setup {
-                    if setup.selected_index > 0 {
-                        setup.selected_index -= 1;
-                    }
-                }
-            }
-            KeyCode::Down => {
-                if let Some(ref mut setup) = self.setup {
-                    if setup.selected_index < 1 {
-                        setup.selected_index += 1;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
     }
@@ -1566,11 +1357,6 @@ impl App {
         self.prompt_in_flight
             || self.agent_streaming
             || self.progress_status.is_some()
-            || self
-                .setup
-                .as_ref()
-                .map(|s| s.install_in_progress)
-                .unwrap_or(false)
     }
 
     /// Get the most recent unacknowledged notification (for the banner).
@@ -2298,58 +2084,6 @@ impl App {
     }
 
     fn apply_shared_snapshot(&mut self, snapshot: SharedStateSnapshot) {
-        // Check if the snapshot contains an auth-related error — if so,
-        // switch to Setup wizard instead of showing a raw error.
-        if let ConnectionState::Failed(ref msg) = snapshot.state {
-            let lower = msg.to_ascii_lowercase();
-            let is_auth_error = lower.contains("auth")
-                || lower.contains("login")
-                || lower.contains("unauthorized")
-                || lower.contains("401")
-                || lower.contains("credentials");
-
-            if is_auth_error && self.mode != AppMode::Setup {
-                let agent_id = if snapshot.agent_name.is_empty() {
-                    "copilot".to_string()
-                } else {
-                    snapshot.agent_name.to_ascii_lowercase()
-                };
-                let profile = crate::agent_registry::lookup_profile(&agent_id);
-
-                let auth_reason = msg
-                    .lines()
-                    .find(|l| {
-                        let ll = l.to_ascii_lowercase();
-                        ll.contains("auth") || ll.contains("login")
-                    })
-                    .unwrap_or("Not authenticated")
-                    .trim()
-                    .to_string();
-
-                let preflight = PreflightResult {
-                    agent_id: profile.id.to_string(),
-                    display_name: profile.display_name.to_string(),
-                    cli_status: CheckStatus::Passed,
-                    cli_path: None,
-                    auth_status: CheckStatus::Failed(auth_reason),
-                    install_hint: profile.install_hint.to_string(),
-                    install_url: profile.install_url.to_string(),
-                    auth_hint: profile.auth_hint.to_string(),
-                };
-
-                self.mode = AppMode::Setup;
-                self.setup = Some(SetupState {
-                    preflight,
-                    selected_index: 1,
-                    install_in_progress: false,
-                    install_log: Vec::new(),
-                    install_error: None,
-                });
-                self.state = ConnectionState::Disconnected;
-                return;
-            }
-        }
-
         let recommendations_changed = self.recommendations != snapshot.recommendations;
         let completed_turns_changed = self.completed_turns != snapshot.completed_turns;
         let permission_changed = self
@@ -2582,6 +2316,11 @@ impl App {
                 "version": self.agent_version,
                 "model": self.agent_model,
                 "state": state_str,
+                // Empty array (not null/missing) when no models advertised, so
+                // the C++ side can use "array length > 0" as the "show dropdown"
+                // signal without ambiguity.
+                "available_models": self.available_models,
+                "current_model_id": self.current_model_id,
             }
         });
         send_wt_protocol_event(evt.to_string());
@@ -2649,14 +2388,6 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
 }
 
-
-/// Open a URL in the default browser (Windows).
-fn open_url_in_browser(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn()?;
-    Ok(())
-}
 
 fn now_unix_s() -> f64 {
     std::time::SystemTime::now()
