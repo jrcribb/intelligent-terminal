@@ -58,7 +58,9 @@ pub async fn check_auth(agent_id: &str) -> AuthCheckResult {
     }
 
     // Strategy 2: check for known credential files
-    if let Some(status) = check_credential_files(profile) {
+    let cred_result = check_credential_files(profile);
+    tracing::info!(target: "auth", agent = %agent_id, result = ?cred_result, "check_credential_files");
+    if let Some(status) = cred_result {
         return AuthCheckResult {
             status,
             agent_name: profile.display_name.to_string(),
@@ -283,24 +285,27 @@ fn check_credential_files(profile: &AgentProfile) -> Option<AuthStatus> {
             }
         }
         "copilot" => {
-            // GitHub Copilot CLI writes ~/.copilot/config.json after sign-in.
-            // The `loggedInUsers` array is non-empty when at least one host is
-            // authenticated. We check this instead of probing the ACP adapter
-            // because Copilot can take 30+ seconds to start, which is well
-            // beyond any reasonable probe timeout.
-            let path = home.join(".copilot").join("config.json");
-            let bytes = std::fs::read(&path).ok()?;
-            // Strip a `// ...` header line if present (Copilot writes a comment
-            // banner on top, which is technically not valid JSON).
-            let text = String::from_utf8_lossy(&bytes);
-            let json_start = text.find('{')?;
-            let json: serde_json::Value = serde_json::from_str(&text[json_start..]).ok()?;
-            let logged_in = json
-                .get("loggedInUsers")
-                .and_then(|v| v.as_array())
-                .map(|a| !a.is_empty())
+            // Check 1: Windows Credential Manager for copilot-cli token.
+            // This persists across CLI reinstalls — the token survives
+            // even when the CLI is uninstalled and reinstalled via winget.
+            let cmdkey_output = std::process::Command::new("cmd")
+                .args(["/C", "cmdkey /list | findstr /i copilot-cli"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output();
+            let has_credential = cmdkey_output
+                .as_ref()
+                .map(|o| !o.stdout.is_empty())
                 .unwrap_or(false);
-            Some(if logged_in { AuthStatus::Authenticated } else { AuthStatus::NeedsAuth })
+            tracing::info!(target: "auth", has_credential, stdout = ?cmdkey_output.as_ref().map(|o| String::from_utf8_lossy(&o.stdout).to_string()), "copilot cmdkey check");
+            if has_credential {
+                return Some(AuthStatus::Authenticated);
+            }
+
+            // config.json loggedInUsers is unreliable — it persists after
+            // token deletion and CLI uninstall. Only Credential Manager is
+            // the source of truth for Copilot auth.
+            Some(AuthStatus::NeedsAuth)
         }
         _ => None,
     }
@@ -342,7 +347,40 @@ pub fn find_agent_exe(profile: &AgentProfile) -> String {
 }
 
 /// Build the login command for an agent, using full path if needed.
-fn build_login_command(profile: &AgentProfile) -> String {
+/// Fast synchronous credential check — no ACP probe, no async.
+/// Returns true if a credential is likely present (cmdkey / config files).
+/// Used for the optimistic-connect decision: true → try connect,
+/// false → show auth screen directly.
+pub fn has_credential_fast(agent_id: &str) -> bool {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let home = std::path::PathBuf::from(&home);
+
+    match agent_id {
+        "copilot" => {
+            // Check Windows Credential Manager
+            std::process::Command::new("cmd")
+                .args(["/C", "cmdkey /list | findstr /i copilot-cli"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false)
+        }
+        "claude" => {
+            home.join(".claude").join(".credentials.json").exists()
+        }
+        "codex" => {
+            std::env::var("OPENAI_API_KEY").is_ok() || home.join(".codex").exists()
+        }
+        "gemini" => {
+            // InProtocol — always try connect
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn build_login_command(profile: &AgentProfile) -> String {
     let exe = find_agent_exe(profile);
     if exe.contains(' ') {
         format!("\"{}\" login", exe)

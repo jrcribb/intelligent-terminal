@@ -1169,6 +1169,7 @@ impl App {
     }
 
     /// Try to start the ACP client if login just completed.
+    /// Creates fresh channels if previous ones were consumed by a failed attempt.
     pub fn try_start_acp(&mut self) {
         if !self.pending_acp_start {
             return;
@@ -1176,6 +1177,18 @@ impl App {
         self.pending_acp_start = false;
 
         if let (Some(ref tx), Some(ref mut params)) = (&self.event_tx, &mut self.deferred_acp) {
+            // If channels were consumed by a previous (failed) attempt, create fresh ones.
+            if params.prompt_rx.is_none() {
+                let (_ptx, prx) = mpsc::unbounded_channel();
+                let (_ctx, crx) = mpsc::unbounded_channel();
+                let (_ntx, nrx) = mpsc::unbounded_channel();
+                let (_rtx, rrx) = mpsc::unbounded_channel();
+                params.prompt_rx = Some(prx);
+                params.cancel_rx = Some(crx);
+                params.new_session_rx = Some(nrx);
+                params.restart_rx = Some(rrx);
+            }
+
             if let (Some(prompt_rx), Some(cancel_rx), Some(new_session_rx), Some(restart_rx)) = (
                 params.prompt_rx.take(),
                 params.cancel_rx.take(),
@@ -1574,16 +1587,41 @@ impl App {
                             .unwrap_or_else(|| "copilot".to_string());
 
                         if agent.is_available {
-                            self.mode = AppMode::Auth;
-                            self.auth = Some(AuthState {
-                                agent_id: agent_id.clone(),
-                                agent_name,
-                                auth_hint: String::new(),
-                                login_command: String::new(),
-                                checking: true,
-                                status_message: String::new(),
-                            });
-                            self.spawn_auth_check(&agent_id);
+                            let profile = crate::agent_registry::lookup_profile_by_id(&agent_id);
+
+                            // Fast credential check (cmdkey / config files, no ACP probe).
+                            // If found → optimistic connect. If not → auth screen directly.
+                            let has_cred = crate::auth::has_credential_fast(&agent_id);
+
+                            if has_cred {
+                                // Credential found → connect directly
+                                self.update_deferred_acp_agent(&agent_id);
+                                self.mode = AppMode::Chat;
+                                self.state = ConnectionState::Connecting("Starting agent...".to_string());
+                                self.pending_acp_start = true;
+                                self.setup = None;
+                                // Stash auth info for fallback if token is expired
+                                self.auth = Some(AuthState {
+                                    agent_id: agent_id.clone(),
+                                    agent_name,
+                                    auth_hint: profile.auth_hint.to_string(),
+                                    login_command: crate::auth::build_login_command(profile),
+                                    checking: false,
+                                    status_message: String::new(),
+                                });
+                            } else {
+                                // No credential → auth screen directly, no connecting flash
+                                self.mode = AppMode::Auth;
+                                self.setup = None;
+                                self.auth = Some(AuthState {
+                                    agent_id: agent_id.clone(),
+                                    agent_name,
+                                    auth_hint: profile.auth_hint.to_string(),
+                                    login_command: crate::auth::build_login_command(profile),
+                                    checking: false,
+                                    status_message: String::new(),
+                                });
+                            }
                         } else {
                             let profile = crate::agent_registry::lookup_profile_by_id(&agent_id);
                             self.mode = AppMode::Auth;
@@ -2099,21 +2137,38 @@ impl App {
                 tab.scroll_to_bottom();
             }
             AppEvent::AgentError { session_id, message } => {
-                self.state = ConnectionState::Failed(message.clone());
-                self.publish_agent_status();
-                let tab = match session_id.as_deref() {
-                    Some(sid) => self.session_tab_mut(sid),
-                    None => self.current_tab_mut(),
+                // Optimistic-connect fallback: if we have stashed auth info
+                // and the error is auth-related, show the auth screen instead
+                // of a dead error state.
+                let is_auth_error = {
+                    let lower = message.to_lowercase();
+                    lower.contains("authentication required")
+                        || lower.contains("not logged in")
+                        || lower.contains("unauthorized")
+                        || lower.contains("401")
                 };
-                tab.prompt_in_flight = false;
-                tab.agent_streaming = false;
-                tab.progress_status = None;
-                tab.pending_thought_response.clear();
-                tab.activity_frame = 0;
-                tab.pending_agent_response.clear();
-                tab.timing_note = None;
-                tab.pending_completed_turn = None;
-                tab.messages.push(ChatMessage::Error(message));
+                if is_auth_error && self.auth.is_some() {
+                    tracing::info!("AgentError auth fallback: showing auth screen");
+                    self.mode = AppMode::Auth;
+                    self.state = ConnectionState::Disconnected;
+                    // auth is already stashed from handle_fre_setup_key
+                } else {
+                    self.state = ConnectionState::Failed(message.clone());
+                    self.publish_agent_status();
+                    let tab = match session_id.as_deref() {
+                        Some(sid) => self.session_tab_mut(sid),
+                        None => self.current_tab_mut(),
+                    };
+                    tab.prompt_in_flight = false;
+                    tab.agent_streaming = false;
+                    tab.progress_status = None;
+                    tab.pending_thought_response.clear();
+                    tab.activity_frame = 0;
+                    tab.pending_agent_response.clear();
+                    tab.timing_note = None;
+                    tab.pending_completed_turn = None;
+                    tab.messages.push(ChatMessage::Error(message));
+                }
             }
             AppEvent::ExecutionInfo(message) => {
                 self.push_execution_info(message);
