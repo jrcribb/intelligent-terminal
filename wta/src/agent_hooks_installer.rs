@@ -690,11 +690,23 @@ fn install_for_gemini(home: &Path) {
     // install (e.g. from the Settings UI's "Install hooks" button)
     // hangs the timeout. Verified by manual probe in #17.
     //
+    // `GEMINI_CLI_TRUST_WORKSPACE=true`: Gemini 0.41.2 also gates
+    // `extensions install` behind a *folder-trust* prompt that
+    // `--consent` does NOT cover ("Do you trust the files in this
+    // folder? [y/N]"). Without this, the install hangs on stdin and
+    // the Settings UI's "Install hooks" button times out at 60s
+    // (issue: install_for_gemini timed out in wta-install-hooks.log
+    // after Claude + Copilot succeeded). The `--skip-trust` flag is
+    // top-level only and isn't accepted on the `extensions install`
+    // subcommand, so we use the env-var form Gemini documents for
+    // headless / automated environments. See:
+    // https://geminicli.com/docs/cli/trusted-folders/#headless-and-automated-environments
+    //
     // Idempotency: `gemini extensions install` exits 1 with stderr
     // "Extension \"wt-agent-hooks\" is already installed. Please
     // uninstall it first." when the extension is already present.
     // Match on `already installed` to convert that to success.
-    if let Err(e) = run_plugin_cli(
+    if let Err(e) = run_plugin_cli_with_env(
         "gemini",
         &[
             "extensions",
@@ -703,6 +715,7 @@ fn install_for_gemini(home: &Path) {
             "--consent",
             "--skip-settings",
         ],
+        &[("GEMINI_CLI_TRUST_WORKSPACE", "true")],
         "gemini_hooks",
         &["already installed"],
     ) {
@@ -1615,6 +1628,20 @@ struct CliRunOutcome {
 /// resolve through `which::which` first to get the full path
 /// (including the extension) and spawn that.
 fn run_plugin_cli_capture(exe: &str, args: &[&str]) -> std::io::Result<CliRunOutcome> {
+    run_plugin_cli_capture_with_env(exe, args, &[])
+}
+
+/// Same as [`run_plugin_cli_capture`] but injects the supplied
+/// `(name, value)` pairs into the spawned child's environment.
+/// Used by `install_for_gemini` to set
+/// `GEMINI_CLI_TRUST_WORKSPACE=true` so `gemini extensions install`
+/// doesn't hang on the headless folder-trust prompt; behaves
+/// identically to `run_plugin_cli_capture` when `env` is empty.
+fn run_plugin_cli_capture_with_env(
+    exe: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> std::io::Result<CliRunOutcome> {
     use std::process::Stdio;
     let resolved = which::which(exe).ok();
     let mut cmd = match &resolved {
@@ -1625,6 +1652,9 @@ fn run_plugin_cli_capture(exe: &str, args: &[&str]) -> std::io::Result<CliRunOut
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
 
     #[cfg(windows)]
     {
@@ -1679,10 +1709,24 @@ fn run_plugin_cli_capture(exe: &str, args: &[&str]) -> std::io::Result<CliRunOut
 fn run_plugin_cli(
     exe: &str,
     args: &[&str],
+    log_target: &str,
+    idempotency_substrings: &[&str],
+) -> std::io::Result<()> {
+    run_plugin_cli_with_env(exe, args, &[], log_target, idempotency_substrings)
+}
+
+/// Same as [`run_plugin_cli`] but injects the supplied `(name, value)`
+/// pairs into the spawned child's environment. See
+/// [`run_plugin_cli_capture_with_env`] for the underlying mechanics
+/// and the `install_for_gemini` use case.
+fn run_plugin_cli_with_env(
+    exe: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
     _log_target: &str,
     idempotency_substrings: &[&str],
 ) -> std::io::Result<()> {
-    let outcome = run_plugin_cli_capture(exe, args)?;
+    let outcome = run_plugin_cli_capture_with_env(exe, args, env)?;
     if !outcome.success {
         if matches_idempotency_substring(
             &outcome.stdout,
