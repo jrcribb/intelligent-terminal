@@ -132,6 +132,17 @@ pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
         return None;
     }
 
+    // Placeholder state: the input box renders its own static white-bg /
+    // black-fg cell at the prompt position (see ui::input::render). Hide
+    // the real terminal cursor so WT doesn't overlay its focused-pane
+    // block on top — that block fully replaces the cell content and would
+    // hide the painted glyph (in unfocused panes WT draws a hollow outline
+    // and the cell shows through, which is what we already get for free
+    // by hiding the cursor in both focus states).
+    if app.current_tab().input.is_empty() {
+        return None;
+    }
+
     let main_area = if app.show_debug_panel {
         Layout::default()
             .direction(Direction::Horizontal)

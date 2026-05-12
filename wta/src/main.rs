@@ -21,6 +21,7 @@ mod ui_trace;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
+    cursor::SetCursorStyle,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     style::Print,
@@ -1191,6 +1192,9 @@ async fn run_acp_tui_mode(
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     execute!(stdout, Print("\x1b]11;#0c0c0c\x07"))?;
+    // Steady block (DECSCUSR Ps=2): solid filled rectangle, no blink.
+    // Survives the alt-screen swap; restored on exit below.
+    execute!(stdout, SetCursorStyle::SteadyBlock)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1198,7 +1202,15 @@ async fn run_acp_tui_mode(
         run_acp_app(&mut terminal, cli, shell_mgr, wt_connected, debug_rx, pane_identity, wt_event_rx, wt_protocol_channel).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), Print("\x1b]111\x07"), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        SetCursorStyle::DefaultUserShape,
+        // OSC 111: reset bg to terminal default so the host shell isn't
+        // left with our override.
+        Print("\x1b]111\x07"),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     if let Err(e) = result {

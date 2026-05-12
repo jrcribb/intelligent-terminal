@@ -1,5 +1,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::queue;
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::backend::CrosstermBackend;
 use ratatui::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1935,6 +1937,18 @@ impl App {
         ui::render(&mut frame, self);
         ui_trace::log_slow("ui_render", render_started.elapsed(), || self.trace_state());
 
+        // Wrap the whole frame in a synchronized-update boundary (CSI ? 2026
+        // h/l, supported by Windows Terminal). Without it, every cursor
+        // call in the ratatui-crossterm backend (`hide_cursor`,
+        // `show_cursor`, `set_cursor_position` — all `execute!`-based, see
+        // ratatui-crossterm lib.rs:288/292/303) flushes stdout on its own,
+        // so WT can render partial states between them — most visibly the
+        // brief cursor-hidden window during the shimmer redraw, which the
+        // eye reads as the inputbox cursor blinking at ~8Hz. Inside a sync
+        // block WT freezes rendering until End and paints the final state
+        // in a single frame.
+        queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+
         let flush_started = std::time::Instant::now();
         terminal.flush()?;
         ui_trace::log_slow("terminal_flush", flush_started.elapsed(), || {
@@ -1942,18 +1956,22 @@ impl App {
         });
 
         let cursor_started = std::time::Instant::now();
-        match ui::input_cursor_position(self, area) {
-            Some(position) => {
-                terminal.show_cursor()?;
-                terminal.set_cursor_position(position)?;
-            }
-            None => {
-                terminal.hide_cursor()?;
-            }
+        if let Some(position) = ui::input_cursor_position(self, area) {
+            // Order matters: position first, then show. Showing first would
+            // briefly reveal the cursor wherever the flush left it (typically
+            // the last redrawn cell on the chat side) before the move lands.
+            // (Inside the sync block this is academic — WT won't render
+            // either intermediate — but the ordering also documents intent.)
+            terminal.set_cursor_position(position)?;
+            terminal.show_cursor()?;
+        } else {
+            terminal.hide_cursor()?;
         }
         ui_trace::log_slow("terminal_cursor", cursor_started.elapsed(), || {
             self.trace_state()
         });
+
+        queue!(terminal.backend_mut(), EndSynchronizedUpdate)?;
 
         terminal.swap_buffers();
 
@@ -2070,15 +2088,15 @@ impl App {
             }
             AppEvent::Tick => {
                 // Fan out across all tabs: a background tab with an in-flight
-                // prompt should keep its spinner advancing so when the user
-                // switches back the animation is in step. Must match
-                // ACTIVITY_HIGHLIGHT_WINDOWS.len() in ui/chat.rs.
+                // prompt should keep its shimmer phase advancing so when the
+                // user switches back the animation is in step.
                 for tab in self.tab_sessions.values_mut() {
                     if tab.prompt_in_flight
                         || tab.agent_streaming
                         || tab.progress_status.is_some()
                     {
-                        tab.activity_frame = (tab.activity_frame + 1) % 10;
+                        tab.activity_frame =
+                            (tab.activity_frame + 1) % crate::ui::ACTIVITY_CYCLE_FRAMES;
                     }
                 }
                 // Setup-mode spinner: ticks while we're showing the wizard
