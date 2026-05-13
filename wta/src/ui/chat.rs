@@ -9,14 +9,14 @@ use crate::ui_trace;
 
 const ACTIVITY_LABEL: &str = "Thinking…";
 
-// Soft white "shimmer" sweeps right→left across the label, matching the
+// Soft white "shimmer" sweeps left→right across the label, matching the
 // CSS `linear-gradient(90deg, …) + background-position` animation used by
 // the web chat UI. The web version runs at 1.6s/cycle on a 60FPS canvas;
-// we run on the TUI Tick (120ms ≈ 8FPS), so to keep per-frame motion under
-// one cell — required for the band to read as "sweeping" rather than
-// "stepping" — the cycle is stretched. At 36 ticks across the padded
-// 15-cell span (9 label + 2×3 padding) each frame moves ~0.42 cells.
-pub const ACTIVITY_CYCLE_FRAMES: usize = 36;
+// we run on the TUI Tick (120ms ≈ 8FPS). At 18 ticks across the padded
+// 15-cell span (9 label + 2×3 padding) each frame moves ~0.83 cells —
+// still under one cell so the band reads as "sweeping" rather than
+// "stepping", and the cycle finishes in ~2.16s.
+pub const ACTIVITY_CYCLE_FRAMES: usize = 18;
 
 // Padding on both sides lets the highlight enter from off-screen-right and
 // exit off-screen-left instead of clamping at the label edges.
@@ -154,9 +154,9 @@ fn shimmer_label(frame: usize) -> Vec<Span<'static>> {
     let n = chars.len() as f32;
     let span = n + 2.0 * SHIMMER_PAD;
     let phase = (frame % ACTIVITY_CYCLE_FRAMES) as f32 / ACTIVITY_CYCLE_FRAMES as f32;
-    // Center starts at (n + pad), off the right edge, and walks down to
-    // (-pad) at phase=1 — i.e. right→left across the padded span.
-    let center = (n + SHIMMER_PAD) - phase * span;
+    // Center starts at -pad, off the left edge, and walks up to
+    // (n + pad) at phase=1 — i.e. left→right across the padded span.
+    let center = -SHIMMER_PAD + phase * span;
 
     chars
         .into_iter()
