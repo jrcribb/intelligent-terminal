@@ -182,9 +182,6 @@ namespace winrt::TerminalApp::implementation
         std::shared_ptr<Pane> _zoomedPane{ nullptr };
         std::shared_ptr<Pane> _hiddenPane{ nullptr };
 
-        Windows::UI::Xaml::Controls::MenuFlyoutItem _closePaneMenuItem;
-        Windows::UI::Xaml::Controls::MenuFlyoutItem _restartConnectionMenuItem;
-
         winrt::Microsoft::Terminal::Settings::Model::IconStyle _lastIconStyle;
         winrt::hstring _lastIconPath{};
         std::optional<winrt::Windows::UI::Color> _runtimeTabColor{};

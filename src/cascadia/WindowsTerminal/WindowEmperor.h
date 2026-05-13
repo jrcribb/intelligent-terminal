@@ -47,11 +47,6 @@ public:
     const std::vector<std::shared_ptr<::AppHost>>& GetWindows() const noexcept { return _windows; }
     AppHost* GetMostRecentWindow() const noexcept { return _mostRecentWindow(); }
 
-    // Protocol server access
-    const std::wstring& GetComClsid() const noexcept { return _comClsid; }
-    const std::vector<std::shared_ptr<::AppHost>>& GetWindows() const noexcept { return _windows; }
-    AppHost* GetMostRecentWindow() const noexcept { return _mostRecentWindow(); }
-
 private:
     struct SummonWindowSelectionArgs
     {
