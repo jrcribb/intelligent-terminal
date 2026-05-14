@@ -1191,18 +1191,19 @@ pub struct App {
     // Generation captured when the current in-flight autofix prompt was sent.
     // None means the in-flight prompt is not an autofix prompt.
     inflight_autofix_generation: Option<u64>,
-    // Per-tab conversation sessions. Keyed by tab_id string (0-based index).
-    // The active tab is `tab_id`, with `DEFAULT_TAB_ID` ("0") as fallback
-    // before the first `tab_changed` event arrives. Always contains at
-    // least an entry for the active tab; lazily extended on first
-    // `tab_changed` to a new tab.
+    // Per-tab conversation sessions. Keyed by the stable tab GUID WT mints
+    // at tab construction. The active tab is `tab_id` — seeded from the
+    // `--owner-tab-id` CLI arg before ACP init in the WT-spawned path, or
+    // None (falling back to `DEFAULT_TAB_ID`) for manual `wta` runs.
+    // Lazily extended on each new `tab_changed` event.
     pub(crate) tab_sessions: HashMap<String, TabSession>,
     // Reverse lookup: ACP `SessionId` → tab id. Populated from
-    // `AgentConnected` (the implicit tab "0" session) and `SessionAttached`
-    // (lazily-created sessions for other tabs). All ACP-emitted events
-    // route via this map: chunks, tool calls, end notifications all carry
-    // a `session_id`, the App looks up the owning tab and writes to that
-    // `TabSession`. Replaces M1's `inflight_tab_id` slot.
+    // `AgentConnected` (the startup session, bound to whichever tab the
+    // process owns) and `SessionAttached` (lazily-created sessions for
+    // other tabs the user has visited). All ACP-emitted events route via
+    // this map: chunks, tool calls, end notifications all carry a
+    // `session_id`, the App looks up the owning tab and writes to that
+    // `TabSession`.
     session_to_tab: HashMap<String, String>,
     // ── Agent management view state (re-applied on top of theirs) ──
     /// Live & historical CLI agent sessions. Populated from `agent_event`
@@ -1439,6 +1440,7 @@ impl App {
                 // be on PATH in packaged apps — use WinGet Links fallback).
                 let agent_cmd = resolve_agent_cmd(&params.agent_cmd);
                 let acp_model = params.acp_model.clone();
+                let owner_tab_id = self.tab_id.clone();
                 let event_tx = tx.clone();
                 let shell_mgr = Arc::clone(&params.shell_mgr);
                 let wt_connected = params.wt_connected;
@@ -1446,6 +1448,7 @@ impl App {
                 tokio::task::spawn_local(crate::protocol::acp::client::run_acp_client(
                     agent_cmd,
                     acp_model,
+                    owner_tab_id,
                     event_tx,
                     prompt_rx,
                     cancel_rx,
@@ -2442,13 +2445,20 @@ impl App {
                 self.available_models = available_models.clone();
                 self.current_model_id = current_model_id.clone();
                 self.state = ConnectionState::Connected;
-                // Bind the startup session to the implicit tab "0" — the
-                // ACP client lazy-creates a session per-tab, but the
-                // initial one is for tab "0" by convention.
+                // Bind the startup session to whichever tab we own. In the
+                // normal WT-spawned path `self.tab_id` was seeded from
+                // `--owner-tab-id` before ACP init started, so we land
+                // directly under the right GUID. For non-pane invocations
+                // (manual `wta` runs) `self.tab_id` is still None and we
+                // fall back to DEFAULT_TAB_ID.
+                let bind_tab = self
+                    .tab_id
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_TAB_ID.to_string());
                 self.session_to_tab
-                    .insert(session_id.clone(), DEFAULT_TAB_ID.to_string());
-                let default_tab = self.tab_mut(DEFAULT_TAB_ID);
-                default_tab.session_id = Some(session_id);
+                    .insert(session_id.clone(), bind_tab.clone());
+                let tab = self.tab_mut(&bind_tab);
+                tab.session_id = Some(session_id);
                 self.publish_agent_status();
             }
             AppEvent::SessionAttached {
@@ -2805,14 +2815,6 @@ impl App {
                         "tab_changed event received"
                     );
                     if let Some(new_tab_id) = params.get("tab_id").and_then(|v| v.as_str()) {
-                        // If discover_pane_identity failed at startup, self.tab_id is None.
-                        // Use from_tab_id (sent by C++) to initialize it before saving.
-                        if self.tab_id.is_none() {
-                            if let Some(from_id) = params.get("from_tab_id").and_then(|v| v.as_str()) {
-                                tracing::info!(target: "tab_session", from_tab_id = from_id, "initializing tab_id from from_tab_id");
-                                self.tab_id = Some(from_id.to_string());
-                            }
-                        }
                         self.switch_tab_session(new_tab_id.to_string());
                     } else {
                         tracing::warn!(target: "tab_session", "tab_changed: missing tab_id in params");
@@ -4034,24 +4036,6 @@ impl App {
     /// stays exactly where it was.
     fn switch_tab_session(&mut self, new_tab_id: String) {
         let old_tab = self.tab_id.clone();
-
-        // First-ever tab_changed since process start: WT now sends a stable
-        // GUID, but the App seeded `DEFAULT_TAB_ID` ("0") and AgentConnected
-        // already wired session_to_tab → "0". Without migration, the GUID
-        // would get a fresh empty TabSession while chunks still routed into
-        // "0", and the chat area would render blank. Move the implicit
-        // default-tab state under the GUID key once we know what to call it.
-        if old_tab.is_none() && new_tab_id != DEFAULT_TAB_ID {
-            if let Some(default_session) = self.tab_sessions.remove(DEFAULT_TAB_ID) {
-                self.tab_sessions.insert(new_tab_id.clone(), default_session);
-            }
-            for tab in self.session_to_tab.values_mut() {
-                if tab == DEFAULT_TAB_ID {
-                    *tab = new_tab_id.clone();
-                }
-            }
-        }
-
         let entry = self.tab_sessions.entry(new_tab_id.clone()).or_default();
         tracing::info!(
             target: "tab_session",
@@ -4083,10 +4067,9 @@ impl App {
             // Active tab is gone; the next focused tab's tab_changed will
             // arrive imminently, but in the meantime `current_tab()` must
             // not panic. `active_tab_key()` falls back to DEFAULT_TAB_ID
-            // when tab_id is None, so re-materialize that slot — the
-            // initial migration in `switch_tab_session` may have removed
-            // it. The fallback session is empty by design; renders during
-            // the gap just show nothing.
+            // when tab_id is None, so re-materialize that slot. The
+            // fallback session is empty by design; renders during the gap
+            // just show nothing.
             self.tab_id = None;
             self.tab_sessions
                 .entry(DEFAULT_TAB_ID.to_string())

@@ -86,6 +86,15 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = InitialView::Chat)]
     initial_view: InitialView,
 
+    /// Stable GUID of the WT tab that owns this wta process. Passed in by
+    /// TerminalPage when spawning the agent pane (both _OpenOrReuseAgentPane
+    /// and _AutoCreateHiddenAgentPane). Seeded into app_state.tab_id before
+    /// ACP init, so the first AgentConnected binds the session under the
+    /// real tab GUID instead of falling back to the implicit DEFAULT_TAB_ID
+    /// placeholder. Hidden because nothing outside WT should be setting it.
+    #[arg(long, hide = true)]
+    owner_tab_id: Option<String>,
+
     // Legacy flags (hidden, backward compat)
     #[arg(long, hide = true)]
     info: bool,
@@ -1486,6 +1495,7 @@ async fn run_acp_app(
                 tokio::task::spawn_local(protocol::acp::client::run_acp_client(
                     agent_cmd.clone(),
                     cli.acp_model.clone(),
+                    cli.owner_tab_id.clone(),
                     event_tx.clone(),
                     prompt_rx,
                     cancel_rx,
@@ -1714,15 +1724,40 @@ async fn run_acp_app(
 
             if let Some((pane_id, _tab_id, window_id)) = pane_identity {
                 app_state.pane_id = Some(pane_id);
-                // Intentionally NOT seeding app_state.tab_id from
-                // discover_pane_identity: ListTabs still returns the (unstable)
-                // index-based tab id, while WT's tab_changed event now carries
-                // the stable per-tab GUID. Mixing them would leave us looking
-                // up `tab_sessions["0"]` while the first tab_changed creates a
-                // fresh entry under the GUID. Leave tab_id None until the
-                // first tab_changed arrives; `switch_tab_session` then migrates
-                // the default-tab state under the GUID key.
+                // discover_pane_identity returns the legacy unstable tab
+                // index, not the GUID — ignore it. The stable owner-tab GUID
+                // is passed by WT via --owner-tab-id (see below) and seeded
+                // directly into app_state.tab_id.
                 app_state.window_id = Some(window_id);
+            }
+
+            // Seed tab_id from --owner-tab-id (passed by TerminalPage when
+            // spawning the agent pane). With this set, AgentConnected binds
+            // the initial session under the correct GUID immediately, and
+            // tab_changed events later are plain switches — no implicit
+            // DEFAULT_TAB_ID placeholder, no migration heuristics. Falls
+            // back to None for non-pane invocations (manual `wta` runs, the
+            // `wta delegate` subcommand), where the legacy DEFAULT_TAB_ID
+            // path handles routing.
+            //
+            // Materialize the matching `tab_sessions` entry alongside the
+            // tab_id assignment — `current_tab()` borrows immutably and
+            // expects the active key to already be present, so without
+            // pre-inserting we'd panic on the first render before any
+            // event has had a chance to lazy-create it.
+            if let Some(owner_tab_id) = cli.owner_tab_id.clone() {
+                if !owner_tab_id.is_empty() {
+                    tracing::info!(
+                        target: "tab_session",
+                        tab_id = %owner_tab_id,
+                        "seeded app_state.tab_id from --owner-tab-id"
+                    );
+                    app_state
+                        .tab_sessions
+                        .entry(owner_tab_id.clone())
+                        .or_default();
+                    app_state.tab_id = Some(owner_tab_id);
+                }
             }
 
             // ── source-pane context (autofix attribution) ─────────────────

@@ -1702,6 +1702,17 @@ namespace winrt::TerminalApp::implementation
         const auto& globals = _settings.GlobalSettings();
         std::wstring cmdline = std::wstring{ wtaPath };
 
+        // Tell wta which tab owns its pane up-front (passed as a hidden CLI
+        // arg). wta seeds app_state.tab_id from this before any ACP work
+        // starts, so AgentConnected binds the initial session directly under
+        // the right GUID and there is no DEFAULT_TAB_ID placeholder to
+        // migrate later. Tab switches after spawn still flow through
+        // _NotifyAgentTabChanged → tab_changed events.
+        if (const auto stableId = tab->StableId(); !stableId.empty())
+        {
+            cmdline += fmt::format(FMT_COMPILE(L" --owner-tab-id \"{}\""), std::wstring_view{ stableId });
+        }
+
         const auto agentCliPath = _ResolveEffectiveAgentCliPath(globals, [this]() { return _DetectAgentCli(); });
         if (!agentCliPath.empty())
         {
@@ -2220,6 +2231,20 @@ namespace winrt::TerminalApp::implementation
 
         _agentPaneLog("no existing agent pane, creating new one");
 
+        // Tell wta which tab owns this pane up-front (passed as a hidden CLI
+        // arg). wta seeds app_state.tab_id from this before any ACP work
+        // starts, so AgentConnected binds the initial session directly under
+        // the right GUID and there is no DEFAULT_TAB_ID placeholder for
+        // switch_tab_session to migrate later. Tab switches after spawn flow
+        // through _NotifyAgentTabChanged → tab_changed events as normal.
+        if (const auto focusedTab = _GetFocusedTabImpl())
+        {
+            if (const auto stableId = focusedTab->StableId(); !stableId.empty())
+            {
+                cmdline += fmt::format(FMT_COMPILE(L" --owner-tab-id \"{}\""), std::wstring_view{ stableId });
+            }
+        }
+
         // Append the initial prompt to the cmdline when creating a new pane.
         if (!prompt.empty())
         {
@@ -2339,6 +2364,10 @@ namespace winrt::TerminalApp::implementation
 
         // The user explicitly asked to open it on this tab.
         activeTab->AgentPaneOpen(true);
+
+        // No tab_changed needed here — wta was already told its owner tab
+        // via --owner-tab-id in the cmdline. Tab switches from here on
+        // flow through _ReconcileAgentPaneForActiveTab.
 
         // New pane: wta starts in whichever view --initial-view requested
         // (chat by default; sessions when Ctrl+Shift+/ triggered the open).

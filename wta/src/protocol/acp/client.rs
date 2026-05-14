@@ -1476,6 +1476,7 @@ impl acp::Client for WtaClient {
 pub async fn run_acp_client(
     agent_cmd: String,
     acp_model_override: Option<String>,
+    owner_tab_id: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     mut prompt_rx: mpsc::UnboundedReceiver<PromptSubmission>,
     mut cancel_rx: mpsc::UnboundedReceiver<CancelRequest>,
@@ -1499,6 +1500,7 @@ pub async fn run_acp_client(
         match run_inner(
             &agent_cmd,
             acp_model_override.clone(),
+            owner_tab_id.clone(),
             event_tx.clone(),
             &mut prompt_rx,
             &mut cancel_rx,
@@ -1558,6 +1560,7 @@ pub async fn run_acp_client(
 async fn run_inner(
     agent_cmd: &str,
     acp_model_override: Option<String>,
+    owner_tab_id: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptSubmission>,
     cancel_rx: &mut mpsc::UnboundedReceiver<CancelRequest>,
@@ -1851,14 +1854,20 @@ async fn run_inner(
     });
 
     // Per-tab session cache, shared across all in-flight prompt tasks.
-    // The startup session is bound to tab "0" so the agent_status event
-    // pipeline lights up immediately. New tabs lazily create their own
-    // session on first prompt — see `ensure_session_for_tab`.
+    // The startup session is bound to the owner tab GUID passed in by WT
+    // (via --owner-tab-id) so the first prompt on that tab reuses the
+    // already-created session instead of spawning a redundant one. When
+    // `owner_tab_id` is None (manual `wta` runs, no host pane), fall back
+    // to the legacy "0" key to match the App-side DEFAULT_TAB_ID
+    // placeholder.
     let tab_to_session: Arc<tokio::sync::Mutex<HashMap<String, acp::SessionId>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     {
         let mut g = tab_to_session.lock().await;
-        g.insert("0".to_string(), session_id.clone());
+        let initial_tab_key = owner_tab_id
+            .clone()
+            .unwrap_or_else(|| "0".to_string());
+        g.insert(initial_tab_key, session_id.clone());
     }
 
     // Same-tab single-flight guard: at most one prompt in flight per tab.
