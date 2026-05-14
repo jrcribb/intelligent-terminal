@@ -1473,6 +1473,12 @@ async fn run_acp_app(
             // kills the agent child process, drops the connection, and
             // respawns from scratch. State is cleaned up on both sides.
             let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
+            // reset_tab_session channel: App emits a DropSessionRequest when
+            // WT tells us to release a tab's binding (Ctrl+C×2 hide path).
+            // ACP client removes the SessionId from tab_to_session and
+            // cancels any in-flight prompt for it; the next prompt on that
+            // tab lazily creates a fresh session.
+            let (drop_session_tx, drop_session_rx) = tokio::sync::mpsc::unbounded_channel();
 
             // Spawn the ACP client -- but not in setup mode, where the user
             // hasn't chosen an agent yet. Store params for deferred start.
@@ -1484,13 +1490,14 @@ async fn run_acp_app(
                     prompt_rx,
                     cancel_rx,
                     new_session_rx,
+                    drop_session_rx,
                     restart_rx,
                     Arc::clone(&shell_mgr),
                     wt_connected,
                 ));
                 None
             } else {
-                Some((prompt_rx, cancel_rx, new_session_rx, restart_rx))
+                Some((prompt_rx, cancel_rx, new_session_rx, drop_session_rx, restart_rx))
             };
 
             let (recommendation_tx, recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1513,7 +1520,7 @@ async fn run_acp_app(
             ));
 
             let autofix_enabled = !cli.no_autofix;
-            let mut app_state = app::App::new(prompt_tx, recommendation_tx, permission_tx, cancel_tx, new_session_tx, restart_tx, debug_capture_enabled, wt_connected, autofix_enabled);
+            let mut app_state = app::App::new(prompt_tx, recommendation_tx, permission_tx, cancel_tx, new_session_tx, drop_session_tx, restart_tx, debug_capture_enabled, wt_connected, autofix_enabled);
 
             // ── Preflight: check the agent CLI before connecting ──────────
             // Skip preflight when FRE is active — FRE has its own agent
@@ -1691,13 +1698,14 @@ async fn run_acp_app(
             app_state.set_event_tx(event_tx.clone());
 
             // If in setup mode, store ACP params for deferred start after login.
-            if let Some((prompt_rx, cancel_rx, new_session_rx, restart_rx)) = deferred_channels {
+            if let Some((prompt_rx, cancel_rx, new_session_rx, drop_session_rx, restart_rx)) = deferred_channels {
                 app_state.set_acp_params(
                     agent_cmd.clone(),
                     cli.acp_model.clone(),
                     prompt_rx,
                     cancel_rx,
                     new_session_rx,
+                    drop_session_rx,
                     restart_rx,
                     Arc::clone(&shell_mgr),
                     wt_connected,

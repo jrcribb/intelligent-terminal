@@ -64,6 +64,21 @@ pub struct NewSessionForTab {
 #[derive(Debug, Clone, Default)]
 pub struct RestartRequest;
 
+/// Drop the ACP session binding for a tab WITHOUT immediately creating a
+/// replacement. Emitted by the Ctrl+C×2 close-pane path when the agent
+/// pane is being hidden on a tab while other tabs still need it: we
+/// release this tab's SessionId so the next prompt on this tab lazily
+/// spawns a fresh session (handled by [`dispatch_prompt_body`]'s
+/// lazy-create branch).
+///
+/// Distinct from [`NewSessionForTab`], which atomically swaps in a new
+/// session — we don't want to pay the new_session round-trip until the
+/// user actually sends a prompt.
+#[derive(Debug, Clone)]
+pub struct DropSessionRequest {
+    pub tab_id: String,
+}
+
 /// How [`run_inner`] terminated. The outer driver in [`run_acp_client`]
 /// uses this to decide whether to respawn the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1465,6 +1480,7 @@ pub async fn run_acp_client(
     mut prompt_rx: mpsc::UnboundedReceiver<PromptSubmission>,
     mut cancel_rx: mpsc::UnboundedReceiver<CancelRequest>,
     mut new_session_rx: mpsc::UnboundedReceiver<NewSessionForTab>,
+    mut drop_session_rx: mpsc::UnboundedReceiver<DropSessionRequest>,
     mut restart_rx: mpsc::UnboundedReceiver<RestartRequest>,
     shell_mgr: Arc<ShellManager>,
     wt_connected: bool,
@@ -1487,6 +1503,7 @@ pub async fn run_acp_client(
             &mut prompt_rx,
             &mut cancel_rx,
             &mut new_session_rx,
+            &mut drop_session_rx,
             &mut restart_rx,
             Arc::clone(&shell_mgr),
             wt_connected,
@@ -1545,6 +1562,7 @@ async fn run_inner(
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptSubmission>,
     cancel_rx: &mut mpsc::UnboundedReceiver<CancelRequest>,
     new_session_rx: &mut mpsc::UnboundedReceiver<NewSessionForTab>,
+    drop_session_rx: &mut mpsc::UnboundedReceiver<DropSessionRequest>,
     restart_rx: &mut mpsc::UnboundedReceiver<RestartRequest>,
     shell_mgr: Arc<ShellManager>,
     wt_connected: bool,
@@ -1987,6 +2005,48 @@ async fn run_inner(
                         available_models: per_tab_models,
                         current_model_id: per_tab_current,
                     });
+                });
+            }
+            Some(req) = drop_session_rx.recv() => {
+                tracing::info!(
+                    target: "acp_drop_session",
+                    tab = %req.tab_id,
+                    "drop_session requested (no replacement)"
+                );
+                let conn_for_drop = Arc::clone(&conn);
+                let tab_to_session_for_drop = Arc::clone(&tab_to_session);
+                let cancel_signals_for_drop = Arc::clone(&cancel_signals);
+                tokio::task::spawn_local(async move {
+                    let old_sid: Option<acp::SessionId> = {
+                        let mut g = tab_to_session_for_drop.lock().await;
+                        g.remove(&req.tab_id)
+                    };
+                    if let Some(old) = old_sid {
+                        // Signal any in-flight prompt for this session to
+                        // bail out of conn.prompt().await immediately, then
+                        // send a session/cancel to the agent. Mirrors the
+                        // new_session_rx cancel path, minus the new_session
+                        // round-trip.
+                        let old_str = old.to_string();
+                        if let Some(sig) = cancel_signals_for_drop
+                            .lock()
+                            .unwrap()
+                            .remove(&old_str)
+                        {
+                            let _ = sig.send(());
+                        }
+                        if let Err(e) = conn_for_drop
+                            .cancel(acp::CancelNotification::new(old.clone()))
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "acp_drop_session",
+                                tab = %req.tab_id,
+                                error = ?e,
+                                "session/cancel after drop failed (likely unsupported)"
+                            );
+                        }
+                    }
                 });
             }
             Some(prompt) = prompt_rx.recv() => {

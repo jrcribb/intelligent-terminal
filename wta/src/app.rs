@@ -17,6 +17,7 @@ struct DeferredAcpParams {
     prompt_rx: Option<mpsc::UnboundedReceiver<crate::protocol::acp::client::PromptSubmission>>,
     cancel_rx: Option<mpsc::UnboundedReceiver<crate::protocol::acp::client::CancelRequest>>,
     new_session_rx: Option<mpsc::UnboundedReceiver<crate::protocol::acp::client::NewSessionForTab>>,
+    drop_session_rx: Option<mpsc::UnboundedReceiver<crate::protocol::acp::client::DropSessionRequest>>,
     restart_rx: Option<mpsc::UnboundedReceiver<crate::protocol::acp::client::RestartRequest>>,
     shell_mgr: Arc<crate::shell::ShellManager>,
     wt_connected: bool,
@@ -31,7 +32,8 @@ use crate::coordinator::{
 use crate::pane_context::PaneContext;
 
 use crate::protocol::acp::client::{
-    prompt_timing_log, CancelRequest, NewSessionForTab, PromptSubmission, RestartRequest,
+    prompt_timing_log, CancelRequest, DropSessionRequest, NewSessionForTab, PromptSubmission,
+    RestartRequest,
 };
 use crate::ui;
 use crate::ui_trace;
@@ -1157,6 +1159,7 @@ pub struct App {
     permission_tx: mpsc::UnboundedSender<String>,
     cancel_tx: mpsc::UnboundedSender<CancelRequest>,
     new_session_tx: mpsc::UnboundedSender<NewSessionForTab>,
+    drop_session_tx: mpsc::UnboundedSender<DropSessionRequest>,
     restart_tx: mpsc::UnboundedSender<RestartRequest>,
     debug_capture_enabled: Arc<AtomicBool>,
     // Slash-command UI state. The /help overlay is global — it covers
@@ -1240,7 +1243,23 @@ pub struct App {
     /// drives chat-mode spinners; this one is for the wizard view which
     /// has no tab context). Bumped from the Tick handler when in Setup.
     pub activity_frame: u8,
+
+    /// First-press timestamp of the double-Ctrl+C "close pane" sequence. Set
+    /// when the user presses Ctrl+C while input is empty and nothing is in
+    /// flight. A second Ctrl+C within `CLOSE_PANE_ARM_WINDOW` closes the
+    /// pane (we ask WT to do it; ConPty then SIGKILLs us). Cleared on any
+    /// other key, on prompt activity, or after the window elapses.
+    pub close_pane_armed_at: Option<std::time::Instant>,
+    /// Transient one-line hint rendered at the bottom of the chat area
+    /// (e.g. "Press Ctrl+C again to close pane"). Auto-clears at the
+    /// recorded deadline.
+    pub transient_hint: Option<(String, std::time::Instant)>,
 }
+
+/// How long the "Press Ctrl+C again to close pane" arm stays live. Long
+/// enough that the user can react after seeing the hint; short enough that
+/// a stale arm doesn't bite the next time they want to clear input.
+pub const CLOSE_PANE_ARM_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Top-level UI view selector. Toggled with F2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1288,6 +1307,7 @@ impl App {
         permission_tx: mpsc::UnboundedSender<String>,
         cancel_tx: mpsc::UnboundedSender<CancelRequest>,
         new_session_tx: mpsc::UnboundedSender<NewSessionForTab>,
+        drop_session_tx: mpsc::UnboundedSender<DropSessionRequest>,
         restart_tx: mpsc::UnboundedSender<RestartRequest>,
         debug_capture_enabled: Arc<AtomicBool>,
         wt_connected: bool,
@@ -1319,6 +1339,7 @@ impl App {
             permission_tx,
             cancel_tx,
             new_session_tx,
+            drop_session_tx,
             restart_tx,
             debug_capture_enabled,
             help_overlay_visible: false,
@@ -1347,6 +1368,8 @@ impl App {
             source_cwd: None,
             log_agent_events: false,
             activity_frame: 0,
+            close_pane_armed_at: None,
+            transient_hint: None,
         }
     }
 
@@ -1358,6 +1381,7 @@ impl App {
         prompt_rx: mpsc::UnboundedReceiver<crate::protocol::acp::client::PromptSubmission>,
         cancel_rx: mpsc::UnboundedReceiver<crate::protocol::acp::client::CancelRequest>,
         new_session_rx: mpsc::UnboundedReceiver<crate::protocol::acp::client::NewSessionForTab>,
+        drop_session_rx: mpsc::UnboundedReceiver<crate::protocol::acp::client::DropSessionRequest>,
         restart_rx: mpsc::UnboundedReceiver<crate::protocol::acp::client::RestartRequest>,
         shell_mgr: Arc<crate::shell::ShellManager>,
         wt_connected: bool,
@@ -1368,6 +1392,7 @@ impl App {
             prompt_rx: Some(prompt_rx),
             cancel_rx: Some(cancel_rx),
             new_session_rx: Some(new_session_rx),
+            drop_session_rx: Some(drop_session_rx),
             restart_rx: Some(restart_rx),
             shell_mgr,
             wt_connected,
@@ -1388,17 +1413,26 @@ impl App {
                 let (_ptx, prx) = mpsc::unbounded_channel();
                 let (_ctx, crx) = mpsc::unbounded_channel();
                 let (_ntx, nrx) = mpsc::unbounded_channel();
+                let (_dtx, drx) = mpsc::unbounded_channel();
                 let (_rtx, rrx) = mpsc::unbounded_channel();
                 params.prompt_rx = Some(prx);
                 params.cancel_rx = Some(crx);
                 params.new_session_rx = Some(nrx);
+                params.drop_session_rx = Some(drx);
                 params.restart_rx = Some(rrx);
             }
 
-            if let (Some(prompt_rx), Some(cancel_rx), Some(new_session_rx), Some(restart_rx)) = (
+            if let (
+                Some(prompt_rx),
+                Some(cancel_rx),
+                Some(new_session_rx),
+                Some(drop_session_rx),
+                Some(restart_rx),
+            ) = (
                 params.prompt_rx.take(),
                 params.cancel_rx.take(),
                 params.new_session_rx.take(),
+                params.drop_session_rx.take(),
                 params.restart_rx.take(),
             ) {
                 // Resolve the agent executable path (bare "copilot" may not
@@ -1416,6 +1450,7 @@ impl App {
                     prompt_rx,
                     cancel_rx,
                     new_session_rx,
+                    drop_session_rx,
                     restart_rx,
                     shell_mgr,
                     wt_connected,
@@ -2796,6 +2831,15 @@ impl App {
                     return;
                 }
 
+                if method == "reset_tab_session" {
+                    if let Some(tab_id) = params.get("tab_id").and_then(|v| v.as_str()) {
+                        self.reset_tab_session_for(tab_id);
+                    } else {
+                        tracing::warn!(target: "tab_session", "reset_tab_session: missing tab_id in params");
+                    }
+                    return;
+                }
+
                 // set_view: WT broadcasts this from Ctrl+Shift+/ (or any
                 // future "open agent pane in <view>" action) to switch the
                 // active TabSession's TUI view. Absolute (not toggle).
@@ -3163,6 +3207,19 @@ impl App {
             "key received"
         );
 
+        // Any non-Ctrl+C key disarms the close-pane sequence. We allow plain
+        // Ctrl presses (modifier-only events) through so the user can still
+        // hold Ctrl while preparing to tap C the second time. The Ctrl+C
+        // arm-or-fire transitions itself are handled in the match below.
+        let is_ctrl_c = matches!(key.code, KeyCode::Char('c'))
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        if !is_ctrl_c {
+            self.close_pane_armed_at = None;
+            // Don't clear `transient_hint` here — it has its own deadline and
+            // ui::render checks expiry on each draw. Clearing on every key
+            // would steal too much of the hint's visible lifetime.
+        }
+
         // Setup mode: unified setup wizard (FRE + preflight)
         if self.mode == AppMode::Setup {
             self.handle_setup_key(key);
@@ -3465,8 +3522,33 @@ impl App {
                     tab.pending_completed_turn = None;
                     tab.messages.push(ChatMessage::System("Cancelled.".to_string()));
                     tab.scroll_to_bottom();
+                    self.close_pane_armed_at = None;
+                } else if !self.current_tab().input.is_empty() {
+                    // Mirror bash readline: Ctrl+C clears the buffer.
+                    self.current_tab_mut().clear_input();
+                    self.close_pane_armed_at = None;
                 } else {
-                    self.should_quit = true;
+                    // Idle + empty input. First press arms; second press
+                    // within CLOSE_PANE_ARM_WINDOW asks WT to close the
+                    // pane. We never set should_quit ourselves — the pane
+                    // teardown will kill our ConPty, which is the only
+                    // path that should terminate wta.
+                    let now = std::time::Instant::now();
+                    let armed = self
+                        .close_pane_armed_at
+                        .map(|t| now.duration_since(t) < CLOSE_PANE_ARM_WINDOW)
+                        .unwrap_or(false);
+                    if armed {
+                        self.close_pane_armed_at = None;
+                        self.transient_hint = None;
+                        self.request_close_agent_pane();
+                    } else {
+                        self.close_pane_armed_at = Some(now);
+                        self.transient_hint = Some((
+                            "Press Ctrl+C again to close pane".to_string(),
+                            now + CLOSE_PANE_ARM_WINDOW,
+                        ));
+                    }
                 }
             }
             KeyCode::Esc if self.help_overlay_visible => {
@@ -4017,6 +4099,51 @@ impl App {
         );
     }
 
+    /// Wipe per-tab state in place while keeping the `TabSession` slot
+    /// alive. Called when WT sends `reset_tab_session` (the Ctrl+C×2 hide
+    /// path): the WT tab itself isn't going anywhere, but the user asked
+    /// for a clean slate on this tab. After this:
+    ///   - Conversation history, completed turns, in-flight state are gone.
+    ///   - `session_to_tab` entries pointing at this tab are pruned so any
+    ///     late ACP events for the old SessionId can't route back in.
+    ///   - The ACP client task is asked to drop the binding in
+    ///     `tab_to_session` and cancel any in-flight prompt for the old
+    ///     SessionId; the next prompt on this tab lazily creates a fresh
+    ///     ACP session.
+    /// Unlike `drop_tab_session`, this preserves the HashMap key — the
+    /// next tab_changed back into this tab finds an empty-but-present
+    /// `TabSession` and just renders an empty chat.
+    fn reset_tab_session_for(&mut self, tab_id: &str) {
+        // Wipe local state. We don't call clear_chat_history alone because
+        // it doesn't touch completed_turns / prompt_in_flight / agent
+        // metadata — the same combination the `/clear` slash command uses.
+        if let Some(tab) = self.tab_sessions.get_mut(tab_id) {
+            tab.clear_chat_history();
+            tab.completed_turns.clear();
+            tab.selected_completed_turn_idx = None;
+            tab.prompt_in_flight = false;
+            tab.scroll_to_bottom();
+            tab.session_id = None;
+        }
+
+        // Prune the reverse SessionId → tab routing so late ACP chunks for
+        // the dropped session can't land on this tab's slot.
+        self.session_to_tab.retain(|_, t| t != tab_id);
+
+        // Ask the ACP client task to release the binding for this tab.
+        let _ = self
+            .drop_session_tx
+            .send(DropSessionRequest {
+                tab_id: tab_id.to_string(),
+            });
+
+        tracing::info!(
+            target: "tab_session",
+            tab_id = tab_id,
+            "reset_tab_session_for done"
+        );
+    }
+
 
     fn session_completion_latency_summary(&self, session_id: &str) -> Option<String> {
         let mut parts = Vec::new();
@@ -4254,6 +4381,37 @@ impl App {
         send_wt_protocol_event(evt.to_string());
     }
 
+    /// Ask WT to tear down this agent pane. Wired to the second tap of the
+    /// double-Ctrl+C close sequence. WT closes the Pane, which causes its
+    /// ConPty to SIGKILL us — so the natural side effect of pane teardown
+    /// is that wta exits and the in-process `tab_to_session` map dies with
+    /// it. The next time the user toggles the agent pane open, WT spawns a
+    /// fresh wta whose map is empty: per-tab ACP sessions get re-bound to
+    /// the new wta's keyspace, which is the "clean session" semantics we
+    /// want without any explicit per-entry cleanup.
+    ///
+    /// We do NOT set `should_quit` here. If WT's close path is delayed or
+    /// the event is dropped, wta keeps running and the user can try again
+    /// (or use the WT-side close-pane keybinding). Self-quitting would
+    /// race the close request and produce a "process exited" pane that
+    /// the next toggle can't recover from cleanly.
+    fn request_close_agent_pane(&self) {
+        let mut params = serde_json::Map::new();
+        if let Some(ref p) = self.pane_id {
+            params.insert("pane_id".to_string(), serde_json::Value::String(p.clone()));
+        }
+        if let Some(ref t) = self.tab_id {
+            params.insert("tab_id".to_string(), serde_json::Value::String(t.clone()));
+        }
+        let evt = serde_json::json!({
+            "type": "event",
+            "method": "close_agent_pane",
+            "params": serde_json::Value::Object(params),
+        });
+        tracing::info!(target: "close_pane", "double-Ctrl+C → asking WT to close agent pane");
+        send_wt_protocol_event(evt.to_string());
+    }
+
     /// Bottom bar shows "Suggestion ready — open agent pane" (blue/info style).
     /// The full explanation lives in the agent pane chat history; the protocol
     /// event only carries the title used as the bar label.
@@ -4325,8 +4483,9 @@ impl App {
                 let rec_idx = recommended_choice_index(&recommendations);
                 let choice_count = recommendations.choices.len();
                 let recommended_choice = recommendations.recommended_choice;
+                let summary = format_recommendations_for_chat(&recommendations);
                 let tab = self.session_tab_mut(session_id);
-                tab.stage_completed_turn(text, false);
+                tab.stage_completed_turn(summary, false);
                 // Commit immediately so chat history is never blank while the
                 // card is visible. chat::render reads completed_turns, not
                 // pending_completed_turn — leaving it pending makes the prompt
@@ -4538,6 +4697,67 @@ pub(crate) fn rec_card_height(choice: &RecommendationChoice, panel_width: u16) -
 
     // top_border + top_pad + content + divider + buttons + bottom_border + blank = 6 fixed rows.
     6 + content_lines
+}
+
+/// Render a parsed `RecommendationSet` as the agent's "reply" text in chat.
+///
+/// Recommendation responses arrive as JSON; storing the raw JSON in a completed
+/// turn means re-expanding the prompt header reveals raw JSON instead of a
+/// CLI-style answer. This builds a single line per choice that mirrors what the
+/// recommendation cards show, prefixed with `✓` for the recommended one.
+fn format_recommendations_for_chat(set: &RecommendationSet) -> String {
+    use crate::coordinator::{OpenTarget, RecommendedAction};
+
+    let header = if set.choices.len() == 1 {
+        "Suggested 1 option:".to_string()
+    } else {
+        format!("Suggested {} options:", set.choices.len())
+    };
+    let mut out = header;
+
+    for choice in &set.choices {
+        let action_text = choice
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                RecommendedAction::Send { input, .. } => Some(format!("Run: {}", input)),
+                RecommendedAction::OpenAndSend {
+                    target, input, agent, ..
+                } => {
+                    let where_ = match target {
+                        OpenTarget::Tab => "new tab",
+                        OpenTarget::Panel => "new panel",
+                    };
+                    let label = agent.as_deref().unwrap_or("agent");
+                    Some(format!("Open {} and run {}: {}", where_, label, input))
+                }
+                RecommendedAction::Open { target, cwd, title, .. } => {
+                    let kind = match target {
+                        OpenTarget::Tab => "tab",
+                        OpenTarget::Panel => "panel",
+                    };
+                    Some(match (title.as_deref(), cwd.as_deref()) {
+                        (Some(t), Some(c)) if !t.is_empty() && !c.is_empty() => {
+                            format!("Open new {} ({}) in {}", kind, t, c)
+                        }
+                        (Some(t), _) if !t.is_empty() => format!("Open new {} ({})", kind, t),
+                        (_, Some(c)) if !c.is_empty() => format!("Open new {} in {}", kind, c),
+                        _ => format!("Open new empty {}", kind),
+                    })
+                }
+            })
+            .unwrap_or_else(|| choice.title.clone());
+
+        let marker = if set.recommended_choice == Some(choice.choice) {
+            "✓"
+        } else {
+            " "
+        };
+        out.push('\n');
+        out.push_str(&format!("  {} {}. {}", marker, choice.choice, action_text));
+    }
+
+    out
 }
 
 fn append_thought_preview(buffer: &mut String, chunk: &str) {
@@ -4836,9 +5056,10 @@ mod tests {
         let (permission_tx, _permission_rx) = tokio::sync::mpsc::unbounded_channel();
         let (cancel_tx, _cancel_rx) = tokio::sync::mpsc::unbounded_channel();
         let (new_session_tx, _new_session_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (drop_session_tx, _drop_session_rx) = tokio::sync::mpsc::unbounded_channel();
         let (restart_tx, _restart_rx) = tokio::sync::mpsc::unbounded_channel();
         let debug_capture = Arc::new(AtomicBool::new(false));
-        App::new(prompt_tx, recommendation_tx, permission_tx, cancel_tx, new_session_tx, restart_tx, debug_capture, true, false)
+        App::new(prompt_tx, recommendation_tx, permission_tx, cancel_tx, new_session_tx, drop_session_tx, restart_tx, debug_capture, true, false)
     }
 
     // ─── word boundary helpers ──────────────────────────────────────────────

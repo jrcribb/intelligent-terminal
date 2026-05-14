@@ -1326,6 +1326,37 @@ namespace winrt::TerminalApp::implementation
         _lastNotifiedAgentTabId.reset();
     }
 
+    std::shared_ptr<Pane> TerminalPage::_WrapInAgentPaneContent(std::shared_ptr<Pane> rawPane)
+    {
+        if (!rawPane)
+        {
+            return rawPane;
+        }
+        const auto innerTerm = rawPane->GetContent().try_as<winrt::TerminalApp::TerminalPaneContent>();
+        if (!innerTerm)
+        {
+            // Defensive fallback — shouldn't happen for a terminal-content pane.
+            _agentPaneLog("_WrapInAgentPaneContent: rawPane content is not TerminalPaneContent — using unwrapped pane");
+            return rawPane;
+        }
+        // The raw Pane's first border currently parents the TermControl;
+        // release it before AgentPaneContent re-parents it as the wrapper's
+        // ContentPresenter child. Without this, XAML throws because the
+        // TermControl would be in two visual trees at once.
+        if (const auto rootGrid = rawPane->GetRootElement())
+        {
+            if (rootGrid.Children().Size() > 0)
+            {
+                if (const auto border = rootGrid.Children().GetAt(0).try_as<winrt::Windows::UI::Xaml::Controls::Border>())
+                {
+                    border.Child(nullptr);
+                }
+            }
+        }
+        auto agentContent = winrt::make<winrt::TerminalApp::implementation::AgentPaneContent>(innerTerm);
+        return std::make_shared<Pane>(agentContent);
+    }
+
     // Move the single shared agent pane to targetTab and ensure it is visible.
     // No-op if the pane already lives in targetTab and is visible. When the
     // pane crosses tabs, also fires a tab_changed event so wta switches its
@@ -1460,6 +1491,37 @@ namespace winrt::TerminalApp::implementation
             winrt::to_hstring(Json::writeString(wb, tabEvt)));
 
         _lastNotifiedAgentTabId = newTabId;
+    }
+
+    // Tells wta to clear the per-tab session (conversation history + ACP
+    // SessionId binding) WITHOUT dropping the TabSession key. Unlike
+    // _NotifyAgentTabClosed (which means "this tab is gone"), reset means
+    // "tab is still around, but the user wants a clean slate for it." Used
+    // by the Ctrl+C×2 path when at least one other tab still wants the
+    // agent pane: we hide the pane and reset this tab's wta state so the
+    // next toggle on this tab starts fresh.
+    void TerminalPage::_NotifyAgentTabReset(const winrt::hstring& tabId)
+    {
+        if (tabId.empty())
+        {
+            return;
+        }
+        if (!_agentPane.lock())
+        {
+            return;
+        }
+
+        Json::Value tabEvt;
+        tabEvt["type"] = "event";
+        tabEvt["method"] = "reset_tab_session";
+        Json::Value tabParams;
+        tabParams["tab_id"] = winrt::to_string(tabId);
+        tabEvt["params"] = tabParams;
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        ProtocolVtSequenceReceived.raise(
+            *this,
+            winrt::to_hstring(Json::writeString(wb, tabEvt)));
     }
 
     // Tells wta that a tab has been destroyed so it can drop the per-tab
@@ -1740,36 +1802,7 @@ namespace winrt::TerminalApp::implementation
             _pendingProtocolPipeHandles.reset();
         }
 
-        // Wrap the raw terminal pane in an AgentPaneContent so the leaf
-        // renders the XAML agent bar above the wta TermControl. We construct
-        // a fresh Pane around the wrapper because Pane has no API to swap
-        // its content in place.
-        std::shared_ptr<Pane> newPane;
-        if (const auto innerTerm = rawPane->GetContent().try_as<winrt::TerminalApp::TerminalPaneContent>())
-        {
-            // The raw Pane's first border currently parents the TermControl;
-            // release it before AgentPaneContent re-parents it as the wrapper's
-            // ContentPresenter child. Without this, XAML throws because the
-            // TermControl would be in two visual trees at once.
-            if (const auto rootGrid = rawPane->GetRootElement())
-            {
-                if (rootGrid.Children().Size() > 0)
-                {
-                    if (const auto border = rootGrid.Children().GetAt(0).try_as<winrt::Windows::UI::Xaml::Controls::Border>())
-                    {
-                        border.Child(nullptr);
-                    }
-                }
-            }
-            auto agentContent = winrt::make<winrt::TerminalApp::implementation::AgentPaneContent>(innerTerm);
-            newPane = std::make_shared<Pane>(agentContent);
-        }
-        else
-        {
-            // Defensive fallback — shouldn't happen for a terminal-content pane.
-            _agentPaneLog("_AutoCreateHiddenAgentPane: rawPane content is not TerminalPaneContent — using unwrapped pane");
-            newPane = rawPane;
-        }
+        auto newPane = _WrapInAgentPaneContent(rawPane);
 
         newPane->IsAgentPane(true);
         _agentPane = newPane;
@@ -2246,8 +2279,8 @@ namespace winrt::TerminalApp::implementation
         wil::unique_handle pendingWtWrite;
         const bool pipePrepared = _PrepareAgentPanePipe(pendingWtRead, pendingWtWrite);
 
-        auto newPane = _MakeTerminalPane(newTerminalArgs, nullptr, nullptr);
-        if (!newPane)
+        auto rawPane = _MakeTerminalPane(newTerminalArgs, nullptr, nullptr);
+        if (!rawPane)
         {
             _pendingProtocolPipeHandles.reset();
             return;
@@ -2266,6 +2299,11 @@ namespace winrt::TerminalApp::implementation
             _pendingProtocolPipeHandles.reset();
         }
 
+        // Wrap in AgentPaneContent so the 36px XAML agent bar renders above
+        // the wta TermControl. Without this, the post-teardown rebuild path
+        // (Ctrl+C×2 close → toggle open) would produce a pane with no
+        // title bar, and SetSessionsView below would no-op.
+        auto newPane = _WrapInAgentPaneContent(rawPane);
         newPane->IsAgentPane(true);
         _agentPane = newPane;
         {
@@ -4014,6 +4052,98 @@ namespace winrt::TerminalApp::implementation
                 agentContent.UpdateAgentStatus(name, version, model, state);
             }
         }
+    }
+
+    // Inbound event from WTA: {method:"close_agent_pane", params:{...}}.
+    // User pressed Ctrl+C twice in the agent pane TUI. Two paths:
+    //
+    //   (1) Other tabs still want the agent pane (their AgentPaneOpen flag
+    //       is true). The pane is shared across all tabs, so we can't kill
+    //       wta — that would wipe every tab's ACP session. Instead we:
+    //         - tell wta to reset just THIS tab's session/conversation,
+    //         - flip THIS tab's AgentPaneOpen to false,
+    //         - hide the pane on this tab.
+    //       The wta process stays alive; switching to another tab brings
+    //       the pane back with that tab's history; toggling this tab on
+    //       again gives the user a clean slate with a fresh ACP session.
+    //
+    //   (2) No other tab wants the pane — this is the last consumer. Fall
+    //       back to the original full teardown: Pane::Close fires Closed,
+    //       _agentPane resets, ConPty SIGKILLs wta, and all in-process
+    //       state dies with it. Next toggle anywhere spawns a fresh wta.
+    void TerminalPage::OnCloseAgentPaneRequested(hstring /*eventJson*/)
+    {
+        _agentPaneLog("OnCloseAgentPaneRequested: user requested close from wta");
+        const auto agentPane = _agentPane.lock();
+        if (!agentPane)
+        {
+            _agentPaneLog("OnCloseAgentPaneRequested: no agent pane alive — no-op");
+            return;
+        }
+
+        // The pane lives on the tab containing it; that's the "current" tab
+        // from wta's perspective. Don't trust _GetFocusedTabImpl() here —
+        // the user could have switched WT tabs after pressing Ctrl+C but
+        // before the protocol event landed on the UI thread.
+        const auto ownerTab = _FindTabContainingAgentPane();
+        if (!ownerTab)
+        {
+            _agentPaneLog("OnCloseAgentPaneRequested: pane has no owner tab — falling back to full teardown");
+            _TeardownAgentPane();
+            return;
+        }
+
+        // Count other tabs that still want the agent pane. Excludes the
+        // owner tab itself.
+        bool anyOtherWantsOpen = false;
+        for (const auto& t : _tabs)
+        {
+            const auto tabImpl = _GetTabImpl(t);
+            if (!tabImpl || tabImpl == ownerTab)
+            {
+                continue;
+            }
+            if (tabImpl->AgentPaneOpen())
+            {
+                anyOtherWantsOpen = true;
+                break;
+            }
+        }
+
+        if (!anyOtherWantsOpen)
+        {
+            _agentPaneLog("OnCloseAgentPaneRequested: last tab consumer — full teardown");
+            _TeardownAgentPane();
+            return;
+        }
+
+        _agentPaneLog("OnCloseAgentPaneRequested: other tabs still want the pane — hide + reset this tab");
+
+        // Tell wta to drop this tab's ACP session + conversation. Fire this
+        // BEFORE flipping AgentPaneOpen so wta sees the reset request while
+        // its tab_to_session for ownerTab is still populated. (Order isn't
+        // strict — the events are queued — but it's the natural sequence.)
+        _NotifyAgentTabReset(ownerTab->StableId());
+
+        ownerTab->AgentPaneOpen(false);
+
+        // Only hide if the pane is currently visible on the owner tab. If
+        // it's already hidden (e.g. user switched tabs between Ctrl+C and
+        // this event), the flag-flip above is enough; reconcile will keep
+        // it hidden the next time this tab becomes active.
+        if (!agentPane->IsHidden())
+        {
+            if (const auto rootPane = ownerTab->GetRootPane())
+            {
+                rootPane->HidePane(agentPane);
+                if (const auto target = _FindSourceOfAgentPaneId(rootPane))
+                {
+                    ownerTab->FocusPane(target.value());
+                }
+            }
+        }
+
+        _UpdateBottomBarState();
     }
 
     // Send {method:"autofix_execute",params:{pane_id}} over the outbound

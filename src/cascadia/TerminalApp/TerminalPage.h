@@ -209,6 +209,7 @@ namespace winrt::TerminalApp::implementation
         Windows::Foundation::IAsyncOperation<bool> FocusProtocolPane(winrt::guid sessionId);
         void OnAutofixStateChanged(hstring eventJson);
         void OnAgentStatusChanged(hstring eventJson);
+        void OnCloseAgentPaneRequested(hstring eventJson);
 
         til::property_changed_event PropertyChanged;
 
@@ -368,6 +369,16 @@ namespace winrt::TerminalApp::implementation
         void _TeardownAgentPane();
         void _RebuildAgentStack();
         void _AutoCreateHiddenAgentPane(winrt::com_ptr<Tab> tab);
+        // Wraps the raw terminal pane's TerminalPaneContent in an
+        // AgentPaneContent so the leaf renders the 36px XAML agent bar
+        // above the wta TermControl. Returns a fresh Pane around the
+        // wrapper; falls back to the raw pane if the content isn't a
+        // TerminalPaneContent (shouldn't happen for a terminal-content
+        // pane). Both pane creation paths (_AutoCreateHiddenAgentPane on
+        // launch, _OpenOrReuseAgentPane after teardown) must go through
+        // this — otherwise post-teardown rebuilds end up with a bare
+        // pane and no title bar.
+        std::shared_ptr<Pane> _WrapInAgentPaneContent(std::shared_ptr<Pane> rawPane);
 
         // Per-tab agent-pane state reconciliation. The single shared agent
         // pane follows the active tab based on each tab's AgentPaneOpen()
@@ -385,6 +396,7 @@ namespace winrt::TerminalApp::implementation
         // created tabs that reuse the closed tab's stable id (it doesn't, but
         // the registry would still grow unboundedly).
         void _NotifyAgentTabClosed(const winrt::hstring& tabId);
+        void _NotifyAgentTabReset(const winrt::hstring& tabId);
         std::optional<winrt::hstring> _lastNotifiedAgentTabId{};
 
         // Tracks whether the agent pane is currently displaying its Agents

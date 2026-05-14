@@ -75,14 +75,32 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         input::input_height(&tab.input, tab.cursor_pos, main_area.width)
     };
 
+    // Expire the transient hint before deciding whether to reserve a row.
+    // Cheap and keeps the layout in lockstep with the rest of the draw.
+    let now = std::time::Instant::now();
+    let hint_visible = app
+        .transient_hint
+        .as_ref()
+        .map(|(_, deadline)| now < *deadline)
+        .unwrap_or(false);
+    if !hint_visible {
+        app.transient_hint = None;
+    }
+    let hint_height = if hint_visible {
+        Constraint::Length(1)
+    } else {
+        Constraint::Length(0)
+    };
+
     // The host (Windows Terminal) renders the agent bar in XAML above this
     // pane, so wta uses the full pane area for chat / recommendations / input.
     //
     // Layout: chat sized to its content, rec panel right below, blank
-    // filler, input at the bottom. Without this, a short chat would let the
-    // `Min(1)` chat constraint absorb all spare space and push the rec
-    // panel to the bottom of the pane, leaving a large empty band between
-    // the prompt and the cards.
+    // filler, optional one-row hint, input at the bottom. Without the
+    // explicit chat height, a short chat would let the `Min(1)` chat
+    // constraint absorb all spare space and push the rec panel to the
+    // bottom of the pane, leaving a large empty band between the prompt
+    // and the cards.
     let chat_content_width = main_area.width.saturating_sub(2); // h_chat 1+1 padding
     let chat_height = chat::estimated_block_height(app, chat_content_width);
     let chunks = Layout::default()
@@ -91,6 +109,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Length(chat_height),
             rec_height,
             Constraint::Min(0),
+            hint_height,
             Constraint::Length(input_height),
         ])
         .split(main_area);
@@ -108,7 +127,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     chat::render(frame, app, h_chat[1]);
     app.sync_rec_scroll_max();
     recommendations::render(frame, app, h_rec[1]);
-    input::render(frame, app, chunks[3]);
+    if hint_visible {
+        if let Some((text, _)) = app.transient_hint.as_ref() {
+            let line = Line::from(Span::styled(
+                format!("  {}", text),
+                Style::default().fg(Color::DarkGray),
+            ));
+            frame.render_widget(line, chunks[3]);
+        }
+    }
+    input::render(frame, app, chunks[4]);
 
     if let Some(debug_area) = debug_area {
         debug_panel::render(frame, app, debug_area);
@@ -166,6 +194,22 @@ pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
         input::input_height(&tab.input, tab.cursor_pos, main_area.width)
     };
 
+    // Match the constraint layout in `render` — the hint row sits between
+    // filler and input, so the input chunk is at index 4 (not 3) whenever
+    // the hint is visible. Keep both in lockstep or the cursor lands on
+    // the wrong line.
+    let now = std::time::Instant::now();
+    let hint_visible = app
+        .transient_hint
+        .as_ref()
+        .map(|(_, deadline)| now < *deadline)
+        .unwrap_or(false);
+    let hint_height = if hint_visible {
+        Constraint::Length(1)
+    } else {
+        Constraint::Length(0)
+    };
+
     let chat_content_width = main_area.width.saturating_sub(2);
     let chat_height = chat::estimated_block_height(app, chat_content_width);
     let chunks = Layout::default()
@@ -174,9 +218,10 @@ pub fn input_cursor_position(app: &App, area: Rect) -> Option<Position> {
             Constraint::Length(chat_height),
             rec_height,
             Constraint::Min(0),
+            hint_height,
             Constraint::Length(input_height),
         ])
         .split(main_area);
 
-    input::cursor_position(app, chunks[3])
+    input::cursor_position(app, chunks[4])
 }

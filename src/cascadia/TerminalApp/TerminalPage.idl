@@ -131,5 +131,10 @@ namespace TerminalApp
         // Called by the COM server on the UI thread; the page forwards the values
         // to the AgentPaneContent so the XAML agent bar can refresh.
         void OnAgentStatusChanged(String eventJson);
+
+        // Inbound event from WTA carrying {method:"close_agent_pane",params:{...}}.
+        // Emitted when the user presses Ctrl+C twice in the agent pane TUI.
+        // The page tears down the shared agent pane; wta dies with its ConPty.
+        void OnCloseAgentPaneRequested(String eventJson);
     }
 }
