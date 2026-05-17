@@ -3,14 +3,13 @@
 
 #include "pch.h"
 #include "FreOverlay.h"
+#include "FreAgentEntry.g.cpp"
 #include "FreOverlay.g.cpp"
 
-#include <LibraryResources.h>
+#include "../inc/AgentRegistry.h"
 
 using namespace winrt::Windows::Foundation;
 using namespace winrt::Windows::UI::Xaml;
-using namespace winrt::Windows::UI::Xaml::Input;
-using namespace winrt::Windows::UI::Xaml::Media;
 using namespace winrt::Windows::UI::Xaml::Controls;
 
 namespace winrt::TerminalApp::implementation
@@ -18,106 +17,130 @@ namespace winrt::TerminalApp::implementation
     FreOverlay::FreOverlay()
     {
         InitializeComponent();
-
-        // When the overlay (or its parent window) resizes, clamp the dialog
-        // so it doesn't end up off-screen.
-        _rootSizeChangedToken = RootGrid().SizeChanged(
-            [weakThis = get_weak()](const auto& /*sender*/, const SizeChangedEventArgs& /*args*/) {
-                if (auto self = weakThis.get())
-                {
-                    self->_ClampDialogPosition();
-                }
-            });
-
-        // Pre-load per-section detail strings.
-        _detailTitles = {
-            RS_(L"FreOverlay_DetailTitle"),
-            RS_(L"FreOverlay_Detail2Title"),
-            RS_(L"FreOverlay_Detail3Title"),
-            RS_(L"FreOverlay_Detail4Title"),
-        };
-        _detailDescs = {
-            RS_(L"FreOverlay_DetailDescription"),
-            RS_(L"FreOverlay_Detail2Description"),
-            RS_(L"FreOverlay_Detail3Description"),
-            RS_(L"FreOverlay_Detail4Description"),
-        };
     }
 
-    // ── Localized string getters (x:Bind, evaluated once) ───────────────
+    // ── Agent detection ─────────────────────────────────────────────────
 
-    winrt::hstring FreOverlay::FreTitle()       { return RS_(L"FreOverlay_Title"); }
-    winrt::hstring FreOverlay::Card1Title()     { return RS_(L"FreOverlay_Card1Title"); }
-    winrt::hstring FreOverlay::Card1Description() { return RS_(L"FreOverlay_Card1Description"); }
-    winrt::hstring FreOverlay::Card2Title()     { return RS_(L"FreOverlay_Card2Title"); }
-    winrt::hstring FreOverlay::Card2Description() { return RS_(L"FreOverlay_Card2Description"); }
-    winrt::hstring FreOverlay::Card3Title()     { return RS_(L"FreOverlay_Card3Title"); }
-    winrt::hstring FreOverlay::Card3Description() { return RS_(L"FreOverlay_Card3Description"); }
-    winrt::hstring FreOverlay::Card4Title()     { return RS_(L"FreOverlay_Card4Title"); }
-    winrt::hstring FreOverlay::Card4Description() { return RS_(L"FreOverlay_Card4Description"); }
-    winrt::hstring FreOverlay::DetailTitle()    { return _detailTitles[0]; }
-    winrt::hstring FreOverlay::DetailDescription() { return _detailDescs[0]; }
-    winrt::hstring FreOverlay::DetailLink()     { return RS_(L"FreOverlay_DetailLink"); }
-    winrt::hstring FreOverlay::NextButtonText() { return RS_(L"FreOverlay_NextButton"); }
-
-    // ── Navigation ──────────────────────────────────────────────────────
-
-    void FreOverlay::_OnNavItemTapped(const IInspectable& sender,
-                                      const winrt::Windows::UI::Xaml::Input::TappedRoutedEventArgs& /*args*/)
+    bool FreOverlay::_IsAgentInstalled(const wchar_t* name)
     {
-        if (const auto fe = sender.try_as<FrameworkElement>())
+        wchar_t buf[MAX_PATH];
+        if (SearchPathW(nullptr, name, L".exe", MAX_PATH, buf, nullptr) > 0)
+            return true;
+        const auto cmdName = std::wstring(name) + L".cmd";
+        if (SearchPathW(nullptr, cmdName.c_str(), nullptr, MAX_PATH, buf, nullptr) > 0)
+            return true;
+        return false;
+    }
+
+    // ── Initialize ──────────────────────────────────────────────────────
+
+    void FreOverlay::Initialize(const winrt::Microsoft::Terminal::Settings::Model::CascadiaSettings& settings)
+    {
+        _settings = settings;
+        const auto& globals = _settings.GlobalSettings();
+        namespace Reg = ::Microsoft::Terminal::Settings::Model::AgentRegistry;
+
+        // Populate agent ComboBox: Copilot (always) + detected agents
+        auto items = AgentComboBox().Items();
+        items.Clear();
+        int32_t selectedIndex = 0;
+        int32_t idx = 0;
+        const auto currentAgent = globals.AcpAgent();
+
+        for (const auto& a : Reg::BuiltinAcpAgents)
         {
-            if (const auto tag = fe.Tag())
+            const bool installed = _IsAgentInstalled(std::wstring{ a.id }.c_str());
+            const bool isCopilot = (a.id == L"copilot");
+
+            // Show Copilot always + detected agents only
+            if (!isCopilot && !installed)
+                continue;
+
+            auto entry = winrt::make<FreAgentEntry>();
+            entry.Id(winrt::hstring{ a.id });
+
+            if (isCopilot && !installed)
             {
-                const auto idx = winrt::unbox_value<winrt::hstring>(tag);
-                _SelectNavItem(std::stoi(winrt::to_string(idx)));
+                entry.DisplayLabel(winrt::hstring{ std::wstring(a.displayName) + L" (will be installed)" });
             }
+            else
+            {
+                entry.DisplayLabel(winrt::hstring{ std::wstring(a.displayName) + L" (installed)" });
+            }
+
+            items.Append(entry);
+
+            if (a.id == currentAgent)
+            {
+                selectedIndex = idx;
+            }
+            idx++;
         }
+
+        if (items.Size() > 0)
+        {
+            AgentComboBox().SelectedIndex(selectedIndex);
+        }
+
+        // Populate pane position ComboBox
+        auto posItems = PanePositionComboBox().Items();
+        posItems.Clear();
+        posItems.Append(winrt::box_value(L"Bottom"));
+        posItems.Append(winrt::box_value(L"Right"));
+        posItems.Append(winrt::box_value(L"Left"));
+        posItems.Append(winrt::box_value(L"Top"));
+
+        const auto currentPos = globals.AgentPanePosition();
+        if (currentPos == L"right") PanePositionComboBox().SelectedIndex(1);
+        else if (currentPos == L"left") PanePositionComboBox().SelectedIndex(2);
+        else if (currentPos == L"top") PanePositionComboBox().SelectedIndex(3);
+        else PanePositionComboBox().SelectedIndex(0); // default: bottom
+
+        // Set toggles from current settings
+        AutoErrorToggle().IsOn(globals.AutoFixEnabled());
     }
 
-    void FreOverlay::_SelectNavItem(int32_t index)
-    {
-        if (index < 0 || index >= NavItemCount || index == _selectedIndex)
-            return;
-
-        // Clear old selection
-        const Border bgBorders[] = { NavBg0(), NavBg1(), NavBg2(), NavBg3() };
-        const winrt::Windows::UI::Xaml::Shapes::Rectangle selRects[] = { NavSel0(), NavSel1(), NavSel2(), NavSel3() };
-        auto transparent = SolidColorBrush{ winrt::Windows::UI::Colors::Transparent() };
-        bgBorders[_selectedIndex].Background(transparent);
-        bgBorders[_selectedIndex].BorderBrush(transparent);
-        selRects[_selectedIndex].Visibility(Visibility::Collapsed);
-
-        // Set new selection
-        _selectedIndex = index;
-        auto selectedBrush = SolidColorBrush{
-            winrt::Windows::UI::ColorHelper::FromArgb(0x0A, 0xFF, 0xFF, 0xFF) };
-        bgBorders[_selectedIndex].Background(selectedBrush);
-        bgBorders[_selectedIndex].BorderBrush(selectedBrush);
-        selRects[_selectedIndex].Visibility(Visibility::Visible);
-
-        // Update detail text
-        DetailTitleText().Text(_detailTitles[index]);
-        DetailDescRun().Text(_detailDescs[index]);
-
-        // "Learn more" link only on the first tab
-        if (index == 0)
-        {
-            DetailLinkSpacer().Text(L" ");
-            DetailLinkRun().Text(RS_(L"FreOverlay_DetailLink"));
-        }
-        else
-        {
-            DetailLinkSpacer().Text(L"");
-            DetailLinkRun().Text(L"");
-        }
-    }
-
-    // ── Button handlers ─────────────────────────────────────────────────
+    // ── Page navigation ─────────────────────────────────────────────────
 
     void FreOverlay::_OnNextButtonClick(const IInspectable& /*sender*/,
                                         const RoutedEventArgs& /*args*/)
     {
+        WelcomePage().Visibility(Visibility::Collapsed);
+        SettingsPage().Visibility(Visibility::Visible);
+    }
+
+    // ── Save & complete ─────────────────────────────────────────────────
+
+    void FreOverlay::_OnSaveButtonClick(const IInspectable& /*sender*/,
+                                        const RoutedEventArgs& /*args*/)
+    {
+        if (_settings)
+        {
+            const auto& globals = _settings.GlobalSettings();
+
+            // Save agent selection
+            if (const auto selected = AgentComboBox().SelectedItem())
+            {
+                if (const auto entry = selected.try_as<winrt::TerminalApp::FreAgentEntry>())
+                {
+                    globals.AcpAgent(entry.Id());
+                }
+            }
+
+            // Save auto-error detection
+            globals.AutoFixEnabled(AutoErrorToggle().IsOn());
+
+            // Save pane position
+            const auto posIdx = PanePositionComboBox().SelectedIndex();
+            switch (posIdx)
+            {
+            case 1: globals.AgentPanePosition(L"right"); break;
+            case 2: globals.AgentPanePosition(L"left"); break;
+            case 3: globals.AgentPanePosition(L"top"); break;
+            default: globals.AgentPanePosition(L"bottom"); break;
+            }
+        }
+
         Completed.raise(*this, nullptr);
     }
 
@@ -127,105 +150,9 @@ namespace winrt::TerminalApp::implementation
         Completed.raise(*this, nullptr);
     }
 
-    // ── Drag-to-move handlers ───────────────────────────────────────────
-
-    void FreOverlay::_OnTitleBarPointerPressed(const IInspectable& /*sender*/,
-                                               const PointerRoutedEventArgs& e)
-    {
-        const auto point = e.GetCurrentPoint(RootGrid());
-        // Only react to the primary button (left-click / touch / pen primary).
-        if (point.Properties().IsRightButtonPressed() || point.Properties().IsMiddleButtonPressed())
-        {
-            return;
-        }
-
-        _titleBarDragging = TitleBarDragArea().CapturePointer(e.Pointer());
-        if (!_titleBarDragging)
-        {
-            return;
-        }
-
-        _dragStartPointer = point.Position();
-        _dragStartTranslateX = DialogTranslate().X();
-        _dragStartTranslateY = DialogTranslate().Y();
-        e.Handled(true);
-    }
-
-    void FreOverlay::_OnTitleBarPointerMoved(const IInspectable& /*sender*/,
-                                             const PointerRoutedEventArgs& e)
-    {
-        if (!_titleBarDragging)
-        {
-            return;
-        }
-
-        const auto point = e.GetCurrentPoint(RootGrid()).Position();
-        const auto deltaX = point.X - _dragStartPointer.X;
-        const auto deltaY = point.Y - _dragStartPointer.Y;
-
-        DialogTranslate().X(_dragStartTranslateX + deltaX);
-        DialogTranslate().Y(_dragStartTranslateY + deltaY);
-
-        _ClampDialogPosition();
-
-        e.Handled(true);
-    }
-
-    void FreOverlay::_OnTitleBarPointerReleased(const IInspectable& /*sender*/,
-                                                const PointerRoutedEventArgs& e)
-    {
-        if (_titleBarDragging)
-        {
-            TitleBarDragArea().ReleasePointerCapture(e.Pointer());
-        }
-        _titleBarDragging = false;
-        e.Handled(true);
-    }
-
-    void FreOverlay::_OnTitleBarPointerCaptureLost(const IInspectable& /*sender*/,
-                                                   const PointerRoutedEventArgs& /*e*/)
-    {
-        _titleBarDragging = false;
-    }
-
-    // ── Clamping & reset ────────────────────────────────────────────────
-
-    void FreOverlay::_ClampDialogPosition()
-    {
-        const auto gridW = RootGrid().ActualWidth();
-        const auto gridH = RootGrid().ActualHeight();
-        const auto dlgW = DialogViewbox().ActualWidth();
-        const auto dlgH = DialogViewbox().ActualHeight();
-
-        if (gridW <= 0 || gridH <= 0)
-        {
-            return;
-        }
-
-        // The dialog is HorizontalAlignment=Center, VerticalAlignment=Center,
-        // so at TranslateTransform (0,0) it sits in the middle.  The maximum
-        // offset in each direction before the dialog leaves the visible area:
-        const auto maxX = (gridW - dlgW) / 2.0;
-        const auto maxY = (gridH - dlgH) / 2.0;
-
-        // If the window is smaller than the dialog, allow zero offset.
-        const auto clampX = (std::max)(0.0, maxX);
-        const auto clampY = (std::max)(0.0, maxY);
-
-        auto x = DialogTranslate().X();
-        auto y = DialogTranslate().Y();
-
-        x = (std::max)(-clampX, (std::min)(x, clampX));
-        y = (std::max)(-clampY, (std::min)(y, clampY));
-
-        DialogTranslate().X(x);
-        DialogTranslate().Y(y);
-    }
+    // ── No-op: kept for IDL compatibility ───────────────────────────────
 
     void FreOverlay::ResetDragOffset()
     {
-        DialogTranslate().X(0);
-        DialogTranslate().Y(0);
-        _titleBarDragging = false;
     }
 }
