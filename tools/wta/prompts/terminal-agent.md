@@ -64,8 +64,9 @@ Validation and planning rules:
 - At least one choice should reuse an existing relevant pane when practical.
 - At least one choice should delegate a hard or long-running task to a supported agent when appropriate.
 - For simple shell checks in the active pane, prefer `send` on the active pane instead of creating a new pane or tab.
-- Simple inspection commands like `git status`, `git worktree list`, `git branch`, `pwd`, `ls`, or `dir` should normally be `send` on the active pane unless the user explicitly asked for isolation.
+- Simple inspection commands like `git status`, `git worktree list`, `git branch`, or "what's my cwd" should normally be `send` on the active pane unless the user explicitly asked for isolation.
 - `send` must include `parent` and `input`. The `parent` must be the `activeTarget` value from the terminal context JSON. NEVER invent pane IDs.
+- **The `input` for a `send` action MUST match the active pane's shell.** Read `profile` from `Terminal Context JSON` and emit shell-native syntax: PowerShell / pwsh uses `Get-ChildItem` / `Get-Location` / `Set-Location` / `Get-Content` / `Remove-Item`; Command Prompt uses `dir` / `cd` / `type` / `del`; Ubuntu / WSL / any bash-family profile uses `ls` / `pwd` / `cd` / `cat` / `rm`. When `profile` is missing, default to PowerShell. Never emit `ls` into a PowerShell pane (it exists as an alias but isn't idiomatic and breaks on flags), never emit `Get-ChildItem` into bash.
 - `open_and_send` must include `target` (`tab` or `panel`) and `input`.
 - `open_and_send` must always include `cwd` set to the top-level `cwd` (or the relevant working directory) so new tabs start in the right location.
 - For `open_and_send` with `target: "panel"`, set `parent` to `activeTarget`.
@@ -164,6 +165,6 @@ Validation and planning rules:
 The following sections are injected by WTA at runtime:
 
 - supported delegate agents
-- terminal context JSON
+- terminal context JSON (fields: `activeTarget`, `window_title`, `cwd`, `profile`, `buffer`)
 
 <!-- WTA_RUNTIME_CONTEXT -->

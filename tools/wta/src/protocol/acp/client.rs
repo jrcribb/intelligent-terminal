@@ -20,6 +20,57 @@ use crate::shell::{ShellManager, TerminalConfig};
 
 const ACTIVE_PANE_CONTEXT_MAX_CHARS: usize = 4000;
 
+/// Which prompt template was last shipped on a given ACP session.
+/// Used by [`TemplateMemo`] to decide whether the next turn needs to
+/// re-include the (~10k char) template body or can ride on the
+/// persona already installed in the session's conversation history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateKind {
+    Planner,
+    Autofix,
+}
+
+impl std::fmt::Display for TemplateKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TemplateKind::Planner => f.write_str("planner"),
+            TemplateKind::Autofix => f.write_str("autofix"),
+        }
+    }
+}
+
+/// Per-session memo of the last shipped template kind.
+///
+/// Each ACP session has its own conversation history with the agent.
+/// We pay the ~10k-char template body once on the first turn of a
+/// session; subsequent turns only carry runtime context + the user
+/// request, because the planner persona is already in history. When
+/// the kind changes (planner ↔ autofix) we re-ship so the model's
+/// most-recent system instructions match the turn's intent.
+///
+/// Cleanup is driven by the session lifecycle: `forget()` runs
+/// whenever a SessionId is dropped (via `/new` or `drop_session_rx`),
+/// keeping the map bounded.
+#[derive(Clone, Default)]
+struct TemplateMemo(Arc<tokio::sync::Mutex<HashMap<String, TemplateKind>>>);
+
+impl TemplateMemo {
+    /// Records `kind` as the latest template for this session and
+    /// returns whether the caller must ship the template body on this
+    /// turn. Autofix always ships (its template *is* the prompt body);
+    /// planner ships on the first turn or when the previous turn used
+    /// the other kind.
+    async fn should_ship(&self, session_id: &str, kind: TemplateKind) -> bool {
+        let prev = self.0.lock().await.insert(session_id.to_string(), kind);
+        kind == TemplateKind::Autofix || prev != Some(kind)
+    }
+
+    /// Drops the memo entry for a session that's going away.
+    async fn forget(&self, session_id: &str) {
+        self.0.lock().await.remove(session_id);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PromptSubmission {
     pub id: u64,
@@ -900,10 +951,22 @@ async fn build_terminal_context_json(shell_mgr: &ShellManager) -> Option<String>
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    // Shell profile (e.g. "PowerShell", "Command Prompt", "Ubuntu") is
+    // load-bearing for the planner: any `send` action it emits has to
+    // match the active pane's shell syntax (`Get-ChildItem` vs `ls`,
+    // `Set-Location` vs `cd`, etc.). Without this the agent has to
+    // guess from the buffer's prompt prefix, which silently fails on
+    // renamed or unusual profiles.
+    let target_profile = active
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
     tracing::debug!(
         target: "acp.terminal_context",
         target_pane_id = %target_pane_id,
+        profile = ?target_profile,
         "terminal_context_target_resolved"
     );
 
@@ -919,6 +982,7 @@ async fn build_terminal_context_json(shell_mgr: &ShellManager) -> Option<String>
         "activeTarget": target_pane_id,
         "window_title": target_window_title,
         "cwd": target_cwd,
+        "profile": target_profile,
         "buffer": buffer,
     }))
     .ok()
@@ -929,6 +993,7 @@ async fn build_prompt_text(
     submitted_at_unix_s: f64,
     user_text: &str,
     is_autofix: bool,
+    include_template: bool,
     shell_mgr: &ShellManager,
     wt_connected: bool,
     pane_context: Option<&PaneContext>,
@@ -1026,15 +1091,7 @@ async fn build_prompt_text(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let platform = if cfg!(target_os = "windows") {
-                        "windows"
-                    } else if cfg!(target_os = "macos") {
-                        "macos"
-                    } else {
-                        "linux"
-                    };
                     let json = serde_json::to_string(&serde_json::json!({
-                        "platform": platform,
                         "profile": profile,
                         "cwd": cwd,
                     }))
@@ -1063,12 +1120,25 @@ async fn build_prompt_text(
     }
 
     let assemble_started = std::time::Instant::now();
-    let prompt_body = prompt::merge_runtime_sections(&planner_template.content, &runtime_sections);
-    // Autofix prompt is self-contained — terminal buffer is injected via the
-    // runtime context marker and the instructions are in the template itself.
-    // No "## User Request" section is needed.
+    // First turn of a session (or kind change): ship the full template
+    // body. Subsequent same-kind turns drop the template — the agent
+    // already has the persona in its conversation history. Autofix
+    // turns always carry the template because the template *is* the
+    // prompt body (no user_text alongside it).
+    let prompt_body = if include_template {
+        prompt::merge_runtime_sections(&planner_template.content, &runtime_sections)
+    } else {
+        runtime_sections
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
     let prompt = if is_autofix {
         prompt_body
+    } else if prompt_body.is_empty() {
+        format!("## User Request\n{}", user_text)
     } else {
         format!("{}\n\n## User Request\n{}", prompt_body, user_text)
     };
@@ -1077,10 +1147,11 @@ async fn build_prompt_text(
         submitted_at_unix_s,
         "prompt_assembled",
         &format!(
-            "assemble_dt={:.3}s total_context_dt={:.3}s prompt_len={}",
+            "assemble_dt={:.3}s total_context_dt={:.3}s prompt_len={} include_template={}",
             assemble_started.elapsed().as_secs_f64(),
             total_started.elapsed().as_secs_f64(),
-            prompt.len()
+            prompt.len(),
+            include_template
         ),
     );
     (
@@ -1109,6 +1180,66 @@ fn acp_log_built_prompt(
     );
     tracing::debug!(target: "acp", "planner_prompt_text:\n{}", prompt_text);
     tracing::debug!(target: "acp", "planner_prompt_end");
+}
+
+/// Per-turn audit log: one structured info-level line per round.
+///
+/// Use this to verify rounds 2+ on a session are "clean" — i.e. the
+/// prompt body no longer carries the planner template. Look for
+/// `include_template=false` paired with a `body_head` that does NOT
+/// start with `# Terminal Agent`.
+///
+/// Snippets are short on purpose (newlines escaped) so each turn fits
+/// on one log line and stays greppable.
+fn log_turn_trace(
+    prompt_id: u64,
+    session_id: &str,
+    kind: TemplateKind,
+    include_template: bool,
+    prompt_text: &str,
+) {
+    const HEAD_LEN: usize = 200;
+    const TAIL_LEN: usize = 150;
+    let head = snippet(prompt_text, HEAD_LEN, true);
+    let tail = if prompt_text.chars().count() > HEAD_LEN + TAIL_LEN {
+        snippet(prompt_text, TAIL_LEN, false)
+    } else {
+        String::new()
+    };
+    tracing::info!(
+        target: "acp.turn_trace",
+        turn = prompt_id,
+        session = %session_short(session_id),
+        kind = %kind,
+        include_template,
+        prompt_len = prompt_text.len(),
+        body_head = %head,
+        body_tail = %tail,
+        "turn_sent"
+    );
+}
+
+/// Take `max_chars` from either end of `text` and inline newlines as
+/// `\n` so the snippet fits on a single log line.
+fn snippet(text: &str, max_chars: usize, from_start: bool) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let slice: String = if from_start {
+        chars.truncate(max_chars.min(len));
+        chars.into_iter().collect()
+    } else {
+        let start = len.saturating_sub(max_chars);
+        chars.drain(..start);
+        chars.into_iter().collect()
+    };
+    slice.replace('\n', "\\n")
+}
+
+/// Last 8 chars of a SessionId for compact logging.
+fn session_short(session_id: &str) -> String {
+    let chars: Vec<char> = session_id.chars().collect();
+    let start = chars.len().saturating_sub(8);
+    chars[start..].iter().collect()
 }
 
 #[derive(Clone)]
@@ -1863,6 +1994,11 @@ async fn run_inner(
         g.insert(initial_tab_key, session_id.clone());
     }
 
+    // Tracks which template each session last saw, so we can drop the
+    // template body on subsequent same-kind turns. Cleared on session
+    // teardown (see new_session_rx / drop_session_rx arms).
+    let template_memo = TemplateMemo::default();
+
     // Same-tab single-flight guard: at most one prompt in flight per tab.
     // The ACP protocol allows concurrent prompts across sessions, but
     // within a session the turns must be ordered, so we enforce per-tab
@@ -1937,6 +2073,7 @@ async fn run_inner(
                 );
                 let conn_for_new = Arc::clone(&conn);
                 let tab_to_session_for_new = Arc::clone(&tab_to_session);
+                let template_memo_for_new = template_memo.clone();
                 let cancel_signals_for_new = Arc::clone(&cancel_signals);
                 let event_tx_for_new = event_tx.clone();
                 tokio::task::spawn_local(async move {
@@ -1953,6 +2090,7 @@ async fn run_inner(
 
                     if let Some(ref old) = old_sid {
                         let old_str = old.to_string();
+                        template_memo_for_new.forget(&old_str).await;
                         if let Some(sig) = cancel_signals_for_new
                             .lock()
                             .unwrap()
@@ -2017,6 +2155,7 @@ async fn run_inner(
                 );
                 let conn_for_drop = Arc::clone(&conn);
                 let tab_to_session_for_drop = Arc::clone(&tab_to_session);
+                let template_memo_for_drop = template_memo.clone();
                 let cancel_signals_for_drop = Arc::clone(&cancel_signals);
                 tokio::task::spawn_local(async move {
                     let old_sid: Option<acp::SessionId> = {
@@ -2030,6 +2169,7 @@ async fn run_inner(
                         // new_session_rx cancel path, minus the new_session
                         // round-trip.
                         let old_str = old.to_string();
+                        template_memo_for_drop.forget(&old_str).await;
                         if let Some(sig) = cancel_signals_for_drop
                             .lock()
                             .unwrap()
@@ -2056,6 +2196,7 @@ async fn run_inner(
                     prompt,
                     &conn,
                     &tab_to_session,
+                    &template_memo,
                     &in_flight_tabs,
                     &cancel_signals,
                     &event_tx,
@@ -2080,6 +2221,7 @@ fn dispatch_prompt(
     prompt: PromptSubmission,
     conn: &Arc<acp::ClientSideConnection>,
     tab_to_session: &Arc<tokio::sync::Mutex<HashMap<String, acp::SessionId>>>,
+    template_memo: &TemplateMemo,
     in_flight_tabs: &Arc<std::sync::Mutex<HashSet<String>>>,
     cancel_signals: &Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     event_tx: &mpsc::UnboundedSender<AppEvent>,
@@ -2105,6 +2247,7 @@ fn dispatch_prompt(
 
     let conn_task = Arc::clone(conn);
     let tab_to_session_task = Arc::clone(tab_to_session);
+    let template_memo_task = template_memo.clone();
     let in_flight_tabs_task = Arc::clone(in_flight_tabs);
     let cancel_signals_task = Arc::clone(cancel_signals);
     let event_tx_task = event_tx.clone();
@@ -2116,6 +2259,7 @@ fn dispatch_prompt(
         prompt,
         conn_task,
         tab_to_session_task,
+        template_memo_task,
         in_flight_tabs_task,
         cancel_signals_task,
         event_tx_task,
@@ -2134,6 +2278,7 @@ async fn dispatch_prompt_body(
     prompt: PromptSubmission,
     conn_task: Arc<acp::ClientSideConnection>,
     tab_to_session_task: Arc<tokio::sync::Mutex<HashMap<String, acp::SessionId>>>,
+    template_memo: TemplateMemo,
     in_flight_tabs_task: Arc<std::sync::Mutex<HashSet<String>>>,
     cancel_signals_task: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     event_tx_task: mpsc::UnboundedSender<AppEvent>,
@@ -2199,12 +2344,22 @@ async fn dispatch_prompt_body(
             };
             let prompt_session_id_str = prompt_session_id.to_string();
 
+            let kind = if prompt.is_autofix {
+                TemplateKind::Autofix
+            } else {
+                TemplateKind::Planner
+            };
+            let include_template = template_memo
+                .should_ship(&prompt_session_id_str, kind)
+                .await;
+
             prompt_timing_task.activate(&prompt_session_id_str, &prompt);
             let (text, prompt_source, prompt_name) = build_prompt_text(
                 prompt.id,
                 prompt.submitted_at_unix_s,
                 &prompt.text,
                 prompt.is_autofix,
+                include_template,
                 &shell_mgr_task,
                 wt_connected,
                 prompt.pane_context.as_ref(),
@@ -2216,6 +2371,13 @@ async fn dispatch_prompt_body(
                 &prompt.text,
                 prompt.pane_context.as_ref(),
                 &prompt_source,
+                &text,
+            );
+            log_turn_trace(
+                prompt.id,
+                &prompt_session_id_str,
+                kind,
+                include_template,
                 &text,
             );
             let _ = event_tx_task.send(AppEvent::ProgressStatus {
