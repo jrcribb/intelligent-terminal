@@ -1,4 +1,4 @@
-// wta/src/agent_hooks_installer.rs
+// tools/wta/src/agent_hooks_installer.rs
 //
 // Auto-install / status / uninstall the wt-agent-hooks bridge for Claude
 // Code, Copilot CLI, and Gemini CLI.
@@ -16,10 +16,10 @@
 // Bundle = single source of truth (issue #20)
 // -------------------------------------------
 //
-// The installable plugin contents live entirely under `wta/wt-agent-hooks/`
+// The installable plugin contents live entirely under `tools/wta/wt-agent-hooks/`
 // in the repo, in three CLI-specific subtrees:
 //
-//   wta/wt-agent-hooks/
+//   tools/wta/wt-agent-hooks/
 //     claude/                              <- passed to `claude plugin marketplace add`
 //       .claude-plugin/marketplace.json
 //       wt-agent-hooks/                    <- the plugin folder Claude copies
@@ -48,7 +48,7 @@
 //      e.g. for distributors patching the bundle without rebuilding wta).
 //   2. `<dir-of-current-exe>/wt-agent-hooks/` — where MSIX deposits the
 //      bundle next to `wta.exe`.
-//   3. Walk parents of `current_exe()` looking for `wta/wt-agent-hooks/` —
+//   3. Walk parents of `current_exe()` looking for `tools/wta/wt-agent-hooks/` —
 //      dev-tree fallback for `cargo build` runs against a checked-out repo.
 //
 // If none resolve, the installer logs a warning and skips that CLI's install
@@ -187,7 +187,7 @@ impl CliKind {
         }
     }
 
-    /// Folder name under `wta/wt-agent-hooks/` that holds this CLI's
+    /// Folder name under `tools/wta/wt-agent-hooks/` that holds this CLI's
     /// installable subtree.
     fn dir_name(self) -> &'static str {
         match self {
@@ -322,7 +322,7 @@ mod bundle {
     //!   2. `<dir-of-current-exe>/wt-agent-hooks/` — where the MSIX
     //!      package deposits the loose bundle next to `wta.exe`.
     //!   3. Walk parents of `current_exe()` looking for
-    //!      `wta/wt-agent-hooks/` — dev-tree fallback that mirrors
+    //!      `tools/wta/wt-agent-hooks/` — dev-tree fallback that mirrors
     //!      the walk in `_ResolveWtaExePath` (TerminalSettingsEditor).
     //!
     //! Returns `None` if no on-disk copy is resolvable. The caller is
@@ -387,7 +387,7 @@ mod bundle {
         if let Some(exe) = exe.as_ref() {
             let mut cursor = exe.parent().map(|p| p.to_path_buf());
             while let Some(dir) = cursor {
-                let candidate = dir.join("wta").join("wt-agent-hooks");
+                let candidate = dir.join("tools").join("wta").join("wt-agent-hooks");
                 if any_subtree(&candidate) {
                     return BundleSourceInfo {
                         kind: "dev-tree",
@@ -445,7 +445,7 @@ mod bundle {
         if let Some(exe) = exe.as_ref() {
             let mut cursor = exe.parent().map(|p| p.to_path_buf());
             while let Some(dir) = cursor {
-                let candidate = dir.join("wta").join("wt-agent-hooks");
+                let candidate = dir.join("tools").join("wta").join("wt-agent-hooks");
                 if candidate.is_dir() {
                     out.push(candidate);
                     break;
@@ -2811,8 +2811,8 @@ Registered marketplaces:
         // The exe-sibling and dev-tree probes will still fire. In a
         // cargo-test environment exe-dir is `target/debug/deps/`, so
         // `<exe-dir>/wt-agent-hooks/` won't exist; the parent walk will
-        // find `<repo>/wta/wt-agent-hooks/` though, so this asserts the
-        // dev-tree path wins (we deliberately don't assert "none" here
+        // find `<repo>/tools/wta/wt-agent-hooks/` though, so this asserts
+        // the dev-tree path wins (we deliberately don't assert "none" here
         // because the dev tree IS resolvable — we just check that the
         // env path didn't trip the false-positive).
         let info = bundle::resolve_source();

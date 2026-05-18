@@ -131,10 +131,10 @@ One-shot commands that talk directly to Windows Terminal. Useful for both humans
 
 ```bash
 # Prereq: install Rust (rustup)
-cd wta
+cd tools/wta
 cargo build
 
-# Output binary: wta/target/debug/wta.exe
+# Output binary: tools/wta/target/debug/wta.exe
 
 # Run ACP chat mode
 wta
@@ -154,7 +154,7 @@ wta capture-pane -l 5
 
 ## Relationship to the Windows Terminal repo
 
-WTA lives under the `wta/` subdirectory of the Windows Terminal source tree. It is an independent Rust project, but by design it is a **companion tool** to Windows Terminal:
+WTA lives under the `tools/wta/` subdirectory of the Windows Terminal source tree. It is an independent Rust project, but by design it is a **companion tool** to Windows Terminal:
 
 - The C++ side ships `TerminalProtocolComServer`, exposing `IProtocolServer` via local COM activation
 - The Rust side (WTA) talks to it indirectly by shelling out to `wtcli.exe`, which is the COM client

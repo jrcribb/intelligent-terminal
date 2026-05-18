@@ -768,8 +768,8 @@ namespace winrt::TerminalApp::implementation
         while (!cursor.empty())
         {
             for (const auto& relative : {
-                     std::filesystem::path{ L"wta\\target\\debug\\wta.exe" },
-                     std::filesystem::path{ L"wta\\target\\release\\wta.exe" },
+                     std::filesystem::path{ L"tools\\wta\\target\\debug\\wta.exe" },
+                     std::filesystem::path{ L"tools\\wta\\target\\release\\wta.exe" },
                  })
             {
                 const auto candidate = cursor / relative;

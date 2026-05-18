@@ -33,7 +33,7 @@ wt-agent-hooks/
 ```
 
 `send-event.ps1` is byte-identical across all three subtrees (single source
-of truth — a unit test in `wta/src/agent_hooks_installer.rs` enforces this).
+of truth — a unit test in `tools/wta/src/agent_hooks_installer.rs` enforces this).
 Claude and Copilot share the same plugin manifest and `hooks.json` schema
 modulo the `-CliSource <name>` token; another unit test enforces parity
 between the two so they can never drift.
@@ -74,7 +74,7 @@ Bundle resolution chain (first hit wins, see
 1. `WTA_HOOKS_BUNDLE_DIR` env var — explicit override (highest priority).
 2. `<dir-of-current-exe>/wt-agent-hooks/` — where MSIX deposits the bundle
    next to `wta.exe` (configured by `CascadiaPackage.wapproj`'s Content glob).
-3. Walk parents of `current_exe()` looking for `wta/wt-agent-hooks/` —
+3. Walk parents of `current_exe()` looking for `tools/wta/wt-agent-hooks/` —
    dev-tree fallback.
 4. Materialize the embedded `include_str!` blobs into
    `%LOCALAPPDATA%\IntelligentTerminal\hook-bundle-fallback\<cli>\` —

@@ -1,4 +1,4 @@
-// wta/src/agent_sessions.rs
+// tools/wta/src/agent_sessions.rs
 //
 // Runtime registry for tracking live and historical CLI agent sessions.
 // Independent from `agent_registry.rs`, which is the static catalog of

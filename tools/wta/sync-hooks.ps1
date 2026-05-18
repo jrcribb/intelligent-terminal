@@ -2,13 +2,14 @@
 # Copilot/Gemini plugin install locations under the user's profile.
 #
 # Run this from a normal PowerShell prompt (not the agent session) any time
-# the files under wta/wt-agent-hooks/agent-hooks-plugin/hooks/ or
-# wta/wt-agent-hooks/gemini-extension/hooks/ change. Restart the agent CLIs
+# the files under tools/wta/wt-agent-hooks/agent-hooks-plugin/hooks/ or
+# tools/wta/wt-agent-hooks/gemini-extension/hooks/ change. Restart the agent CLIs
 # (or close+reopen WT) for the new hooks to take effect.
 
 $ErrorActionPreference = 'Stop'
-$repo = Split-Path -Parent $PSScriptRoot   # repo root = parent of wta/
-$wta  = Join-Path $repo 'wta'
+# Script lives at <repo>/tools/wta/sync-hooks.ps1 — repo root is two levels up.
+$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$wta  = Join-Path $repo 'tools\wta'
 $hooksRoot = Join-Path $wta 'wt-agent-hooks'
 
 $pairs = @(

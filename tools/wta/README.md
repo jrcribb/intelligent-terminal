@@ -10,11 +10,11 @@ Customization:
 ### Build
 
 ```bash
-cd wta
+cd tools/wta
 cargo build
 ```
 
-The binary is output to `wta/target/debug/wta.exe`.
+The binary is output to `tools/wta/target/debug/wta.exe`.
 
 ### Run (ACP TUI mode)
 
@@ -152,7 +152,7 @@ in the TUI shows protocol traffic live without tailing log files.
 ## Project Structure
 
 ```
-wta/src/
+tools/wta/src/
 +-- main.rs                    Entry point, CLI subcommands, protocol discovery
 +-- app.rs                     TUI state machine, event loop, debug panel state
 +-- event.rs                   Crossterm event reader
@@ -211,7 +211,7 @@ target/debug/wta.exe
 1. Declare the method in `src/cascadia/TerminalProtocol/TerminalProtocol.idl`
 2. Implement it on `TerminalProtocolComServer` (`src/cascadia/WindowsTerminal/TerminalProtocolComServer.cpp`)
 3. Add a `wtcli` subcommand in `src/tools/wtcli/main.cpp` that calls the new method
-4. Add a `CliChannel::request` arm in `wta/src/shell/wt_channel/cli_channel.rs` mapping a method name to the new `wtcli` subcommand
+4. Add a `CliChannel::request` arm in `tools/wta/src/shell/wt_channel/cli_channel.rs` mapping a method name to the new `wtcli` subcommand
 5. Rebuild WT, wtcli, and wta
 
 ## Architecture Notes

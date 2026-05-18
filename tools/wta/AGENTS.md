@@ -205,13 +205,13 @@ The log level is controlled by `WTA_LOG`; if unset, WTA defaults to a debug filt
 
 ## Build Rule
 
-For normal local WTA development, always produce the binary at `wta/target/debug/wta.exe`.
+For normal local WTA development, always produce the binary at `tools/wta/target/debug/wta.exe`.
 
 - Before running `cargo build` for WTA, kill any active `wta.exe` processes first. A live shared-host session can keep `target/debug/wta.exe` locked and make the build fail with `Access is denied`.
 - Preferred PowerShell sequence:
   - `Get-Process wta -ErrorAction SilentlyContinue | Stop-Process -Force`
-  - `cargo build --manifest-path wta/Cargo.toml`
-- Do not switch to an alternate `--target-dir` just to work around a locked `wta.exe` unless that is explicitly the task. The default expectation is to refresh `wta/target/debug/wta.exe`.
+  - `cargo build --manifest-path tools/wta/Cargo.toml`
+- Do not switch to an alternate `--target-dir` just to work around a locked `wta.exe` unless that is explicitly the task. The default expectation is to refresh `tools/wta/target/debug/wta.exe`.
 
 ## Key Crates
 

@@ -2,7 +2,7 @@
 
 Forward Gemini CLI hook events to Windows Terminal for WTA display.
 
-This is one of three CLI-specific bundles under `wta/wt-agent-hooks/` —
+This is one of three CLI-specific bundles under `tools/wta/wt-agent-hooks/` —
 see the [top-level README](../README.md) for the full picture and how
 the auto-installer in `wta` consumes this folder.
 

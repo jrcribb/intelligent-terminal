@@ -1,4 +1,4 @@
-// wta/src/history_loader.rs
+// tools/wta/src/history_loader.rs
 //
 // Discover historical CLI agent sessions by scanning each CLI's on-disk
 // log/state layout. Used to seed the AgentSessionRegistry with `Historical`
@@ -44,7 +44,7 @@ const MAX_PER_CLI: usize = 50;
 const TITLE_TAIL_BYTES: u64 = 64 * 1024;
 
 /// Fingerprint of wta's embedded auto-fix prompt template
-/// (`wta/prompts/auto-fix.md` first sentence). Whenever wta opens its
+/// (`tools/wta/prompts/auto-fix.md` first sentence). Whenever wta opens its
 /// internal headless Copilot ACP connection for autofix, Copilot CLI
 /// persists a real `~/.copilot/session-state/<acp-uuid>/{workspace.yaml,
 /// events.jsonl}` for that ACP session. The first prompt in

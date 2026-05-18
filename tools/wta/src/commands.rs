@@ -5,8 +5,8 @@
 //! sent as a normal prompt). The autocomplete popup uses [`matches`] for
 //! prefix-filtered suggestions.
 //!
-//! See `wta/src/app.rs` `App::handle_slash_command` for dispatch and
-//! `wta/src/ui/command_popup.rs` for rendering.
+//! See `tools/wta/src/app.rs` `App::handle_slash_command` for dispatch and
+//! `tools/wta/src/ui/command_popup.rs` for rendering.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
