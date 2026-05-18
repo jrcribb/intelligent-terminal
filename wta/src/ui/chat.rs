@@ -10,7 +10,6 @@ use crate::ui_trace;
 
 const ACTIVITY_LABEL: &str = "Thinking…";
 
-const ACTIVITY_PREVIEW_MAX_CHARS: usize = 180;
 const MAX_RENDER_LINE_CHARS: usize = 4096;
 
 /// Estimate the chat block's natural height (in visual rows) given the
@@ -22,10 +21,7 @@ pub fn estimated_block_height(app: &App, area_width: u16) -> u16 {
     let tab = app.current_tab();
     let wrap_width = (area_width as usize).max(1);
 
-    let activity = if tab.prompt_in_flight
-        || tab.agent_streaming
-        || tab.progress_status.is_some()
-    {
+    let activity = if tab.prompt_in_flight && pending_stream_height(tab, wrap_width) == 0 {
         1usize
     } else {
         0
@@ -33,8 +29,17 @@ pub fn estimated_block_height(app: &App, area_width: u16) -> u16 {
 
     let messages: usize = tab.messages.iter().map(|m| message_height(m, wrap_width)).sum();
     let turns: usize = tab.completed_turns.iter().map(|t| turn_height(t, wrap_width)).sum();
+    let pending = pending_stream_height(tab, wrap_width);
 
-    (activity + messages + turns).max(1).min(u16::MAX as usize) as u16
+    (activity + messages + turns + pending).max(1).min(u16::MAX as usize) as u16
+}
+
+fn pending_stream_height(tab: &crate::app::TabSession, wrap_width: usize) -> usize {
+    let Some(text) = pending_render_text(tab) else {
+        return 0;
+    };
+    let body_width = wrap_width.saturating_sub(2).max(1);
+    wrap_count(&text, body_width)
 }
 
 fn wrap_count(text: &str, width: usize) -> usize {
@@ -102,7 +107,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let mut reversed_lines: Vec<Line> = Vec::new();
 
-    let mut pending_lines = build_pending_stream_lines(app);
+    let mut pending_lines = build_pending_stream_lines(app, wrap_width);
     reversed_lines.extend(pending_lines.drain(..).rev());
 
     let mut truncated = false;
@@ -211,37 +216,109 @@ fn build_completed_turn_lines<'a>(
 }
 
 fn build_activity_line(app: &App) -> Option<Line<'static>> {
-    if !(app.current_tab().prompt_in_flight || app.current_tab().agent_streaming || app.current_tab().progress_status.is_some()) {
+    let tab = app.current_tab();
+    if !tab.prompt_in_flight || pending_render_text(tab).is_some() {
         return None;
     }
+    Some(Line::from(shimmer::shimmer_spans(
+        ACTIVITY_LABEL,
+        tab.activity_frame,
+    )))
+}
 
-    let mut spans = shimmer::shimmer_spans(ACTIVITY_LABEL, app.current_tab().activity_frame);
+/// Incrementally extracts a JSON string field's decoded value from a
+/// possibly-truncated text. Handles `\"`, `\\`, `\n`, `\t`, `\u{XXXX}` etc.
+/// Returns the partial value if the closing quote hasn't arrived yet.
+fn extract_json_string_field(text: &str, field: &str) -> Option<String> {
+    let key = format!("\"{field}\"");
+    let start = text.find(&key)?;
+    let rest = text[start + key.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let body = rest.strip_prefix('"')?;
 
-    if let Some((preview, style)) = activity_preview(app) {
-        spans.push(Span::styled(" ", theme::DIM));
-        spans.push(Span::styled(preview, style));
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next() {
+                None => return Some(out),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{08}'),
+                Some('f') => out.push('\u{0C}'),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if hex.len() < 4 {
+                        return Some(out);
+                    }
+                    if let Some(ch) = u32::from_str_radix(&hex, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                    {
+                        out.push(ch);
+                    }
+                }
+                Some(other) => out.push(other),
+            },
+            c => out.push(c),
+        }
     }
-
-    Some(Line::from(spans))
+    Some(out)
 }
 
-fn activity_preview(app: &App) -> Option<(String, Style)> {
-    app.current_tab().progress_status
-        .as_deref()
-        // Server-side "Thinking..." (three ASCII dots) would duplicate the
-        // shimmer label; drop it. The shimmer uses U+2026 so the strings
-        // don't collide on equality.
-        .filter(|s| *s != "Thinking...")
-        .map(single_line_tail_preview)
-        .filter(|text| !text.is_empty())
-        .map(|text| (text, theme::DIM))
+/// Resolves what (if anything) the pending stream should render.
+///
+/// - Buffer starts with a JSON wrapper (autofix): extract the `explanation`
+///   field so the user sees flowing markdown rather than raw JSON syntax.
+///   fix actions lack this field and yield None — the card surfaces on
+///   finalize.
+/// - Buffer is mixed prose followed by a fenced JSON block (planner
+///   terminal-task mode): render only the prose prefix; the recommendation
+///   card replaces it on eager/end-of-turn finalize.
+/// - Pure prose: stream as-is.
+fn pending_render_text(tab: &crate::app::TabSession) -> Option<Cow<'_, str>> {
+    if !tab.prompt_in_flight {
+        return None;
+    }
+    let text = tab.pending_agent_response.as_str();
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("```") || trimmed.starts_with('{') {
+        return extract_json_string_field(text, "explanation")
+            .filter(|s| !s.is_empty())
+            .map(Cow::Owned);
+    }
+    if let Some(fence_pos) = text.find("```") {
+        let prose = text[..fence_pos].trim_end();
+        return if prose.is_empty() {
+            None
+        } else {
+            Some(Cow::Borrowed(prose))
+        };
+    }
+    Some(Cow::Borrowed(text))
 }
 
-fn build_pending_stream_lines(_app: &App) -> Vec<Line<'_>> {
-    // Don't render the raw agent response (typically JSON) while streaming.
-    // The activity indicator is sufficient feedback; the final parsed
-    // recommendations will appear when the response is finalized.
-    Vec::new()
+fn build_pending_stream_lines<'a>(app: &App, wrap_width: usize) -> Vec<Line<'a>> {
+    let Some(text) = pending_render_text(app.current_tab()) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    push_dot_prefixed_lines(
+        &mut lines,
+        &text,
+        wrap_width,
+        theme::DOT_AGENT,
+        theme::AGENT_TEXT,
+    );
+    lines
 }
 
 fn build_pending_text_lines<'a>(label: &str, text: &'a str, style: Style) -> Vec<Line<'a>> {
@@ -261,20 +338,6 @@ fn build_pending_text_lines<'a>(label: &str, text: &'a str, style: Style) -> Vec
 
     lines.push(Line::default());
     lines
-}
-
-fn single_line_tail_preview(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let chars: Vec<char> = collapsed.chars().collect();
-
-    if chars.len() <= ACTIVITY_PREVIEW_MAX_CHARS {
-        return collapsed;
-    }
-
-    let tail: String = chars[chars.len().saturating_sub(ACTIVITY_PREVIEW_MAX_CHARS)..]
-        .iter()
-        .collect();
-    format!("...{tail}")
 }
 
 fn build_message_lines<'a>(

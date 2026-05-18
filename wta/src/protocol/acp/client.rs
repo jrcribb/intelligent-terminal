@@ -2183,10 +2183,6 @@ async fn dispatch_prompt_body(
             let prompt_session_id_str = prompt_session_id.to_string();
 
             prompt_timing_task.activate(&prompt_session_id_str, &prompt);
-            let _ = event_tx_task.send(AppEvent::ProgressStatus {
-                session_id: Some(prompt_session_id_str.clone()),
-                status: "Preparing context...".to_string(),
-            });
             let (text, prompt_source, prompt_name) = build_prompt_text(
                 prompt.id,
                 prompt.submitted_at_unix_s,

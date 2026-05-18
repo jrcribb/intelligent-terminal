@@ -850,11 +850,10 @@ pub struct TabSession {
     pub selected_recommendation: usize,
     pub selected_button: usize,
     pub rec_scroll: Scroll,
-    /// Set to true when an autofix recommendation has already been surfaced
-    /// from the streamed AgentMessageChunks (eager finalize), so the later
-    /// AgentMessageEnd handler can skip the parse + UI work and only run
-    /// cleanup. Reset on every new autofix turn.
-    pub autofix_eagerly_finalized: bool,
+    /// Set when an autofix Fix/Explain or a planner recommendation has been
+    /// surfaced from streamed chunks ahead of `AgentMessageEnd`. Tells the
+    /// end-of-turn handler to skip re-parsing and only clean up.
+    pub eagerly_finalized: bool,
 
     // Prompt identification / completion staging
     pub current_prompt_id: Option<u64>,
@@ -894,7 +893,7 @@ impl TabSession {
         self.selected_recommendation = 0;
         self.selected_button = 0;
         self.rec_scroll.reset();
-        self.autofix_eagerly_finalized = false;
+        self.eagerly_finalized = false;
     }
 
     pub fn clear_chat_history(&mut self) {
@@ -977,7 +976,7 @@ impl TabSession {
         self.clear_chat_history();
         self.current_prompt_text = Some(prompt_text.to_string());
         self.prompt_in_flight = true;
-        self.progress_status = Some("Preparing context...".to_string());
+        self.progress_status = Some("Thinking...".to_string());
         self.activity_frame = 0;
     }
 
@@ -2599,15 +2598,15 @@ impl App {
                 tab.pending_thought_response.clear();
                 tab.pending_agent_response.push_str(&text);
 
-                // Eager autofix surface: don't wait for AgentMessageEnd —
-                // Copilot's Stop/SessionEnd hooks add ~7.5s of latency on
-                // Windows. If the streamed buffer already holds a complete
-                // fenced JSON `fix`, surface it now. Guard on generation so
-                // a superseded in-flight response can't surface a stale card.
-                if self.autofix_pane_id.is_some()
-                    && self.inflight_autofix_generation == Some(self.autofix_generation)
-                {
-                    self.try_eager_finalize_autofix(&session_id);
+                // Surface the card the moment the streamed JSON parses,
+                // instead of waiting for AgentMessageEnd (gated behind
+                // Copilot's Stop/SessionEnd hooks, ~8s on Windows).
+                if self.autofix_pane_id.is_some() {
+                    if self.inflight_autofix_generation == Some(self.autofix_generation) {
+                        self.try_eager_finalize_autofix(&session_id);
+                    }
+                } else {
+                    self.try_eager_finalize_planner(&session_id);
                 }
             }
             AppEvent::AgentMessageEnd { session_id } => {
@@ -2632,7 +2631,7 @@ impl App {
                         tab.pending_thought_response.clear();
                         tab.pending_agent_response.clear();
                         tab.activity_frame = 0;
-                        tab.autofix_eagerly_finalized = false;
+                        tab.eagerly_finalized = false;
                     }
                     self.inflight_autofix_generation = None;
                     return;
@@ -2658,11 +2657,11 @@ impl App {
                 // Stop hook blocks session/prompt's reply for ~7.5s), skip
                 // re-parsing — the card is already on screen. Just clean up
                 // the buffer and the flag so the next turn starts fresh.
-                let eagerly_finalized = self.session_tab(&session_id).autofix_eagerly_finalized;
+                let eagerly_finalized = self.session_tab(&session_id).eagerly_finalized;
                 if eagerly_finalized {
                     let tab = self.session_tab_mut(&session_id);
                     tab.pending_agent_response.clear();
-                    tab.autofix_eagerly_finalized = false;
+                    tab.eagerly_finalized = false;
                     return;
                 }
 
@@ -4298,7 +4297,7 @@ impl App {
 
         self.current_tab_mut().prompt_in_flight = true;
         self.inflight_autofix_generation = Some(self.autofix_generation);
-        self.current_tab_mut().progress_status = Some("Preparing context...".to_string());
+        self.current_tab_mut().progress_status = Some("Thinking...".to_string());
         self.current_tab_mut().activity_frame = 0;
 
         let prompt = PromptSubmission::new_autofix(prompt_text, Some(pane_context));
@@ -4512,37 +4511,7 @@ impl App {
             )
         }) {
             Ok(recommendations) => {
-                let rec_idx = recommended_choice_index(&recommendations);
-                let choice_count = recommendations.choices.len();
-                let recommended_choice = recommendations.recommended_choice;
-                let summary = format_recommendations_for_chat(&recommendations);
-                let tab = self.session_tab_mut(session_id);
-                tab.stage_completed_turn(summary, false);
-                // Commit immediately so chat history is never blank while the
-                // card is visible. chat::render reads completed_turns, not
-                // pending_completed_turn — leaving it pending makes the prompt
-                // + agent reply invisible until the user dismisses the card.
-                // Enter's later commit_pending_completed_turn becomes a no-op.
-                tab.commit_pending_completed_turn();
-                tab.selected_recommendation = rec_idx;
-                tab.selected_button = 0;
-                // Reset scroll so a leftover offset from a previous rec set
-                // doesn't shift the new cards out of view.
-                tab.rec_scroll.reset();
-                tab.recommendations = Some(recommendations);
-                tab.selection_visible_pending = true;
-                // Drop any leftover completed-turn selection so Enter routes
-                // to the new card instead of toggling a stale highlight.
-                tab.selected_completed_turn_idx = None;
-                self.log_selection_phase_for(
-                    session_id,
-                    "selection_ready",
-                    &format!(
-                        "choice_count={} recommended_choice={:?}",
-                        choice_count, recommended_choice
-                    ),
-                );
-                FinalizeOutcome::SelectionReady
+                self.surface_recommendation(session_id, recommendations, "selection_ready")
             }
             Err(err) => {
                 let error_text = format!("{:#}", err).replace('\n', " | ");
@@ -4580,47 +4549,84 @@ impl App {
         }
     }
 
-    /// Eager autofix finalize from streamed AgentMessageChunks.
-    ///
-    /// Called after every chunk push while an autofix is in flight. As soon
-    /// as `pending_agent_response` contains a complete fenced ```json block
-    /// parseable as a `fix` action, surface the recommendation immediately
-    /// — without waiting for `AgentMessageEnd`, which is blocked behind
-    /// Copilot's slow Stop / SessionEnd hooks (~7.5s on Windows due to
-    /// PowerShell cold-start).
-    ///
-    /// Both `Fix` and `Explain` are eagerly surfaced — the system prompt
-    /// enforces "exactly one JSON object in a fenced block, with no other
-    /// text," so a complete parseable response means the model is done
-    /// conceptually. Any late stragglers are no-ops because the chunk
-    /// handler's `prompt_in_flight` and `autofix_pane_id` guards both flip to
-    /// false during eager surface.
-    ///
-    /// `Ignore` is left to the fallback `AgentMessageEnd` path: it represents
-    /// "no parseable JSON yet" which during streaming is the expected state
-    /// for every partial chunk, not a final decision.
+    /// Eagerly surface a planner recommendation card the moment the streamed
+    /// buffer parses, instead of waiting for `AgentMessageEnd` (gated behind
+    /// Copilot's Stop/SessionEnd hooks, ~8s on Windows).
+    fn try_eager_finalize_planner(&mut self, session_id: &str) {
+        let tab = self.session_tab(session_id);
+        if tab.eagerly_finalized || !tab.pending_agent_response.contains("```") {
+            return;
+        }
+        let text = tab.pending_agent_response.clone();
+        let parsed = parse_recommendation_set(&text).and_then(|r| {
+            validate_recommendation_set_for_coordinator_target(&r, self.pane_id.as_deref())
+        });
+        if let Ok(recommendations) = parsed {
+            self.surface_recommendation(session_id, recommendations, "selection_ready_eager");
+            self.session_tab_mut(session_id).eagerly_finalized = true;
+        }
+    }
+
+    /// Surface a planner recommendation card and commit the chat turn.
+    /// Shared between `selection_ready_eager` (streamed) and `selection_ready`
+    /// (end-of-turn) paths.
+    fn surface_recommendation(
+        &mut self,
+        session_id: &str,
+        recommendations: RecommendationSet,
+        phase_name: &str,
+    ) -> FinalizeOutcome {
+        let rec_idx = recommended_choice_index(&recommendations);
+        let choice_count = recommendations.choices.len();
+        let recommended_choice = recommendations.recommended_choice;
+        let summary = format_recommendations_for_chat(&recommendations);
+        let tab = self.session_tab_mut(session_id);
+        tab.stage_completed_turn(summary, false);
+        tab.commit_pending_completed_turn();
+        // The turn's details now own a clone of `messages` (sans User).
+        // Drop the live buffer so the chat doesn't double-render the same
+        // prompt as both an active User bubble and a folded turn header.
+        tab.messages.clear();
+        tab.tool_calls.clear();
+        tab.selected_recommendation = rec_idx;
+        tab.selected_button = 0;
+        tab.rec_scroll.reset();
+        tab.recommendations = Some(recommendations);
+        tab.selection_visible_pending = true;
+        tab.selected_completed_turn_idx = None;
+        tab.prompt_in_flight = false;
+        tab.agent_streaming = false;
+        tab.progress_status = None;
+        tab.activity_frame = 0;
+        tab.pending_thought_response.clear();
+        self.log_selection_phase_for(
+            session_id,
+            phase_name,
+            &format!(
+                "choice_count={} recommended_choice={:?}",
+                choice_count, recommended_choice
+            ),
+        );
+        FinalizeOutcome::SelectionReady
+    }
+
+    /// Eagerly surface a Fix card or Explain chat turn the moment the
+    /// streamed buffer parses, instead of waiting for `AgentMessageEnd`
+    /// (which on Windows is gated behind Copilot's Stop/SessionEnd hooks,
+    /// ~7.5s). `Ignore` falls through to the end-of-turn path.
     fn try_eager_finalize_autofix(&mut self, session_id: &str) {
         if self.autofix_pane_id.is_none() {
             return;
         }
         let tab = self.session_tab(session_id);
-        if tab.autofix_eagerly_finalized {
+        if tab.eagerly_finalized || !tab.pending_agent_response.contains("```") {
             return;
         }
-        // Cheap pre-check: a fenced JSON block needs a closing fence. Avoids
-        // running serde_json on every tiny chunk (10 chunks × 9KB = wasted
-        // work otherwise, even though each parse is microseconds).
-        if !tab.pending_agent_response.contains("```") {
-            return;
-        }
-        // Snapshot the buffer for parsing; don't take ownership — AgentMessageEnd
-        // still needs to clear it, and on a stale generation it must remain
-        // available for stale-cleanup.
         let text = tab.pending_agent_response.clone();
         match parse_autofix_response(&text) {
             AutofixDecision::Fix(recommendations) => {
                 self.surface_autofix_fix(session_id, recommendations, "autofix_fix_eager");
-                self.session_tab_mut(session_id).autofix_eagerly_finalized = true;
+                self.session_tab_mut(session_id).eagerly_finalized = true;
             }
             AutofixDecision::Explain { title, explanation } => {
                 self.surface_autofix_explain(
@@ -4629,24 +4635,14 @@ impl App {
                     explanation,
                     "autofix_explain_eager",
                 );
-                // surface_autofix_explain internally calls clear_recommendations
-                // which resets this flag back to false; re-set it here so the
-                // later AgentMessageEnd short-circuits.
-                self.session_tab_mut(session_id).autofix_eagerly_finalized = true;
+                self.session_tab_mut(session_id).eagerly_finalized = true;
             }
-            // Ignore = "no parseable JSON yet" during streaming. Wait for
-            // more chunks or for AgentMessageEnd to finalize the buffer.
             AutofixDecision::Ignore => {}
         }
     }
 
-    /// Surface a parsed autofix Fix recommendation as an Armed card.
-    ///
-    /// Shared between the streaming eager-finalize path (called from
-    /// `AgentMessageChunk` as soon as a complete fenced JSON block is in the
-    /// buffer) and the fallback `AgentMessageEnd` path. `phase_name` is the
-    /// log label — "autofix_fix_eager" for the streaming path, "autofix_fix"
-    /// for the end-of-turn path — so traces can tell them apart.
+    /// Surface a Fix recommendation as an Armed card. Shared between
+    /// `autofix_fix_eager` (streamed) and `autofix_fix` (end-of-turn) paths.
     fn surface_autofix_fix(
         &mut self,
         session_id: &str,
@@ -4672,15 +4668,6 @@ impl App {
         tab.selected_recommendation = rec_idx;
         tab.recommendations = Some(recommendations);
         tab.selection_visible_pending = true;
-        // Drive the spinner / streaming-cursor / "Thinking…" line off now that
-        // the recommendation is visible. Without this, the eager path leaves
-        // the streaming flags armed until AgentMessageEnd fires — which on
-        // Windows is still blocked behind Copilot's Stop / SessionEnd hooks
-        // (~7.5s), so the UI keeps spinning under an already-actionable card.
-        //
-        // Late stragglers are safe: AgentMessageChunk's `if !prompt_in_flight
-        // { return; }` guard at the top makes any further chunks no-ops, and
-        // AgentMessageEnd's flag-reset block is idempotent.
         tab.prompt_in_flight = false;
         tab.agent_streaming = false;
         tab.progress_status = None;
@@ -4689,15 +4676,9 @@ impl App {
         FinalizeOutcome::SelectionReady
     }
 
-    /// Surface a parsed autofix Explain response as a chat turn + bottom-bar
-    /// suggestion indicator.
-    ///
-    /// Shared between the streaming eager-finalize path
-    /// ("autofix_explain_eager") and the fallback `AgentMessageEnd` path
-    /// ("autofix_explain"). Note: this consumes `autofix_pane_id` (sets it to
-    /// None) — that's intentional and safe even in the eager path, since the
-    /// chunk-handler's `if autofix_pane_id.is_some()` guard means late chunks
-    /// won't re-enter this function.
+    /// Surface an Explain response as a chat turn + bottom-bar suggestion
+    /// indicator. Shared between `autofix_explain_eager` (streamed) and
+    /// `autofix_explain` (end-of-turn) paths.
     fn surface_autofix_explain(
         &mut self,
         session_id: &str,
@@ -4743,7 +4724,6 @@ impl App {
         self.autofix_pane_id = None;
         let tab = self.session_tab_mut(session_id);
         tab.clear_recommendations();
-        // Drive streaming flags off — same rationale as in surface_autofix_fix.
         tab.prompt_in_flight = false;
         tab.agent_streaming = false;
         tab.progress_status = None;
