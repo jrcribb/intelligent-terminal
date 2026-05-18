@@ -115,8 +115,6 @@ pub enum SetupOption {
     SelectAgent { agent: crate::agent_check::AgentStatus },
     /// Preflight: reinstall via winget (automatic)
     Reinstall { agent_id: String, display_name: String },
-    /// Preflight: show install instructions
-    InstallManually { agent_id: String, display_name: String, hint: String },
     /// Preflight: sign in to fix auth
     SignIn { agent_id: String, display_name: String },
     /// Preflight: switch to a different agent
@@ -128,7 +126,6 @@ pub enum SetupOption {
 #[derive(Debug, Clone)]
 pub struct SetupState {
     pub reason: SetupReason,
-    pub agents: Vec<DetectedAgent>,
     pub selected_index: usize,
     /// Preflight result populated from `preflight::check_agent`.
     pub preflight: PreflightResult,
@@ -175,13 +172,6 @@ impl PreflightResult {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DetectedAgent {
-    pub name: String,
-    pub status: String, // e.g. "Installed by default", "Detected", "Not found"
-    pub is_available: bool,
-}
-
 /// Build the unified setup options list based on the setup reason.
 ///
 /// - `FirstRun` / `SwitchAgent`: one `SelectAgent` per known agent.
@@ -194,8 +184,10 @@ pub fn build_setup_options(
 ) -> Vec<SetupOption> {
     match reason {
         SetupReason::FirstRun | SetupReason::SwitchAgent => {
+            // Show Copilot (always) + any detected agents
             all_agents
                 .iter()
+                .filter(|a| a.id == "copilot" || a.cli_found)
                 .map(|a| SetupOption::SelectAgent { agent: a.clone() })
                 .collect()
         }
@@ -210,23 +202,22 @@ pub fn build_setup_options(
                             display_name: status.display_name.clone(),
                         });
                     }
-                    if !status.install_hint.is_empty() {
-                        opts.push(SetupOption::InstallManually {
-                            agent_id: status.id.clone(),
-                            display_name: status.display_name.clone(),
-                            hint: status.install_hint.clone(),
-                        });
-                    }
                 } else if !status.has_credential || *reason == SetupReason::AgentError {
                     // CLI found but auth missing or known to have failed
-                    opts.push(SetupOption::SignIn {
-                        agent_id: status.id.clone(),
-                        display_name: status.display_name.clone(),
-                    });
+                    if status.id == "copilot" {
+                        // Copilot: we can drive the device-flow sign-in
+                        opts.push(SetupOption::SignIn {
+                            agent_id: status.id.clone(),
+                            display_name: status.display_name.clone(),
+                        });
+                    } else {
+                        // Other agents: user must sign in externally, then retry
+                        opts.push(SetupOption::Retry);
+                    }
                 }
-                // Offer switching to any other agent (detected or not)
+                // Offer switching to Copilot or any detected agent
                 for a in all_agents {
-                    if a.id != status.id {
+                    if a.id != status.id && (a.id == "copilot" || a.cli_found) {
                         opts.push(SetupOption::SwitchAgent { agent: a.clone() });
                     }
                 }
@@ -745,7 +736,7 @@ pub enum AppEvent {
         params: serde_json::Value,
     },
     /// Background agent install completed — refresh the detected agents list.
-    AgentInstallComplete(Vec<DetectedAgent>),
+    AgentInstallComplete,
     /// Login progress — device code received, display to user.
     LoginProgress { device_code: String, verify_url: String },
     /// Login flow completed.
@@ -1080,8 +1071,14 @@ pub struct App {
     event_tx: Option<mpsc::UnboundedSender<AppEvent>>,
     /// Set after login completes — consumed by main loop to spawn ACP client.
     pub pending_acp_start: bool,
+    /// Agent ID selected by user (FRE/preflight) — sent to C++ once connected.
+    pending_agent_selection: Option<String>,
+    /// Show first-run welcome hint until user sends first message.
+    pub show_welcome_hint: bool,
     deferred_acp: Option<DeferredAcpParams>,
     pub state: ConnectionState,
+    /// The agent ID we're trying to connect to (set at preflight/FRE time).
+    pub current_agent_id: String,
     pub agent_name: String,
     pub agent_model: Option<String>,
     pub agent_version: Option<String>,
@@ -1264,8 +1261,11 @@ impl App {
             auth: None,
             event_tx: None,
             pending_acp_start: false,
+            pending_agent_selection: None,
+            show_welcome_hint: false,
             deferred_acp: None,
             state: ConnectionState::Connecting("Starting agent...".to_string()),
+            current_agent_id: String::new(),
             agent_name: String::new(),
             agent_model: None,
             agent_version: None,
@@ -1348,15 +1348,18 @@ impl App {
             return;
         }
         self.pending_acp_start = false;
+        tracing::info!(target: "acp", has_event_tx = self.event_tx.is_some(), has_deferred = self.deferred_acp.is_some(), "try_start_acp triggered");
 
         if let (Some(ref tx), Some(ref mut params)) = (&self.event_tx, &mut self.deferred_acp) {
             // If channels were consumed by a previous (failed) attempt, create fresh ones.
+            // Also update self.prompt_tx so the App sends prompts to the new ACP client.
             if params.prompt_rx.is_none() {
-                let (_ptx, prx) = mpsc::unbounded_channel();
+                let (ptx, prx) = mpsc::unbounded_channel();
                 let (_ctx, crx) = mpsc::unbounded_channel();
                 let (_ntx, nrx) = mpsc::unbounded_channel();
                 let (_dtx, drx) = mpsc::unbounded_channel();
                 let (_rtx, rrx) = mpsc::unbounded_channel();
+                self.prompt_tx = ptx;
                 params.prompt_rx = Some(prx);
                 params.cancel_rx = Some(crx);
                 params.new_session_rx = Some(nrx);
@@ -1593,6 +1596,24 @@ impl App {
         self.last_dispatched_command.clone()
     }
 
+    /// Build the resolved ACP command string for an agent (e.g. "C:\...\claude.exe --acp").
+    fn build_agent_cmd(&self, agent_id: &str) -> String {
+        let profile = crate::agent_registry::lookup_profile_by_id(agent_id);
+        let cmd = if !profile.acp_launch_command.is_empty() {
+            profile.acp_launch_command.to_string()
+        } else {
+            let exe = crate::agent_check::find_exe(agent_id)
+                .unwrap_or_else(|| agent_id.to_string());
+            let mut cmd = exe;
+            for flag in profile.acp_flags {
+                cmd.push(' ');
+                cmd.push_str(flag);
+            }
+            cmd
+        };
+        resolve_agent_cmd(&cmd)
+    }
+
     /// Update the deferred ACP params to use the selected agent's command.
     fn update_deferred_acp_agent(&mut self, agent_id: &str) {
         if agent_id.is_empty() {
@@ -1617,6 +1638,10 @@ impl App {
             tracing::info!("Updating ACP agent command: {} -> {}", params.agent_cmd, resolved);
             params.agent_cmd = resolved;
         }
+        // Remember the selected agent so we can notify C++ after connection succeeds.
+        // We don't notify now because mid-FRE WriteSettingsToDisk triggers
+        // _RebuildAgentStack which tears down the in-progress agent pane.
+        self.pending_agent_selection = Some(agent_id.to_string());
     }
 
     pub fn set_event_tx(&mut self, tx: mpsc::UnboundedSender<AppEvent>) {
@@ -1817,7 +1842,7 @@ impl App {
                 if let Some(ref setup) = self.setup {
                     if let Some(opt) = setup.options.get(setup.selected_index) {
                         match opt {
-                            SetupOption::Reinstall { .. } | SetupOption::InstallManually { .. } => {
+                            SetupOption::Reinstall { .. } => {
                                 let url = setup.preflight.install_url.clone();
                                 if !url.is_empty() {
                                     let _ = open_url_in_browser(&url);
@@ -1840,15 +1865,24 @@ impl App {
                 let agent_id = agent.id.clone();
                 let agent_name = agent.display_name.clone();
                 let profile = crate::agent_registry::lookup_profile_by_id(&agent_id);
+                self.current_agent_id = agent_id.clone();
+                tracing::info!(target: "setup_key", agent_id = %agent_id, cli_found = agent.cli_found, has_deferred = self.deferred_acp.is_some(), "SelectAgent/SwitchAgent entered");
 
                 if agent.cli_found {
                     let has_cred = crate::agent_check::has_credential(&agent_id);
+                    tracing::info!(target: "setup_key", agent_id = %agent_id, has_cred = has_cred, "credential check");
                     if has_cred {
                         // Credential found → connect directly
                         self.update_deferred_acp_agent(&agent_id);
                         self.mode = AppMode::Chat;
                         self.state = ConnectionState::Connecting("Starting agent...".to_string());
-                        self.pending_acp_start = true;
+                        // FRE mode uses deferred_acp, preflight mode uses restart_tx
+                        if self.deferred_acp.is_some() {
+                            self.pending_acp_start = true;
+                        } else {
+                            let new_cmd = self.build_agent_cmd(&agent_id);
+                            let _ = self.restart_tx.send(RestartRequest { agent_cmd: Some(new_cmd) });
+                        }
                         self.setup = None;
                         self.auth = Some(AuthState {
                             agent_id: agent_id.clone(),
@@ -1860,6 +1894,7 @@ impl App {
                         });
                     } else {
                         // No credential → auth screen
+                        self.update_deferred_acp_agent(&agent_id);
                         self.mode = AppMode::Auth;
                         self.setup = None;
                         self.auth = Some(AuthState {
@@ -1869,6 +1904,26 @@ impl App {
                             login_command: crate::agent_check::build_login_cmd(&agent_id),
                             checking: false,
                             status_message: String::new(),
+                        });
+                    }
+                } else if agent.can_auto_install() {
+                    // Copilot not found → auto-install via winget
+                    if let Some(ref mut setup) = self.setup {
+                        setup.install_in_progress = true;
+                        setup.install_log.clear();
+                        setup.install_error = None;
+                        setup.preflight.agent_id = agent_id.clone();
+                        setup.preflight.display_name = agent_name.clone();
+                    }
+                    if let Some(ref tx) = self.event_tx {
+                        let tx = tx.clone();
+                        let id = agent_id.clone();
+                        tokio::task::spawn_local(async move {
+                            let on_line = |line: String| {
+                                tracing::info!(target: "install", "{}", line);
+                            };
+                            let _ = crate::agent_check::install(&id, on_line).await;
+                            let _ = tx.send(AppEvent::AgentInstallComplete);
                         });
                     }
                 } else {
@@ -1881,7 +1936,7 @@ impl App {
                     self.mode = AppMode::Setup;
                     self.setup = Some(SetupState {
                         reason,
-                        agents: Vec::new(),
+
                         selected_index: 0,
                         preflight: PreflightResult {
                             agent_id: agent_id.clone(),
@@ -1930,45 +1985,8 @@ impl App {
                                 tracing::warn!("Reinstall {} failed: {}", id, e);
                             }
                         }
-                        // Re-detect and refresh UI
-                        let updated = crate::agent_check::check_all_agents()
-                            .into_iter()
-                            .map(|s| {
-                                let status = s.status_label();
-                                DetectedAgent { name: s.display_name, status, is_available: s.cli_found }
-                            })
-                            .collect();
-                        let _ = tx.send(AppEvent::AgentInstallComplete(updated));
+                        let _ = tx.send(AppEvent::AgentInstallComplete);
                     });
-                }
-            }
-            SetupOption::InstallManually { hint, .. } => {
-                if !hint.is_empty() {
-                    // Copy install command to clipboard via powershell
-                    // (avoids cmd echo/pipe issues that corrupt the TUI)
-                    #[cfg(windows)]
-                    {
-                        let _ = std::process::Command::new("powershell")
-                            .args(["-NoProfile", "-Command", &format!("Set-Clipboard '{}'", hint.replace('\'', "''"))])
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .spawn();
-                    }
-                    // Update status message to inform user
-                    if let Some(ref mut setup) = self.setup {
-                        setup.install_error = None;
-                        setup.install_log.clear();
-                        setup.install_log.push(format!("Copied to clipboard: {}", hint));
-                        setup.install_log.push("Paste in your terminal to install, then restart.".to_string());
-                    }
-                }
-                // Also open URL if available
-                if let Some(ref setup) = self.setup {
-                    let url = setup.preflight.install_url.clone();
-                    if !url.is_empty() {
-                        let _ = open_url_in_browser(&url);
-                    }
                 }
             }
             SetupOption::SignIn { agent_id, display_name } => {
@@ -1994,7 +2012,12 @@ impl App {
                             self.mode = AppMode::Chat;
                             self.state =
                                 ConnectionState::Connecting("Starting agent...".to_string());
-                            self.pending_acp_start = true;
+                            if self.deferred_acp.is_some() {
+                                self.pending_acp_start = true;
+                            } else {
+                                let new_cmd = self.build_agent_cmd(&agent_id);
+                                let _ = self.restart_tx.send(RestartRequest { agent_cmd: Some(new_cmd) });
+                            }
                             self.setup = None;
                         }
                     }
@@ -2272,7 +2295,7 @@ impl App {
             AppEvent::SystemMessage(_) => "system_message",
             AppEvent::DebugPipeMessage(_) => "debug_pipe_message",
             AppEvent::WtEvent { .. } => "wt_event",
-            AppEvent::AgentInstallComplete(_) => "agent_install_complete",
+            AppEvent::AgentInstallComplete => "agent_install_complete",
             AppEvent::LoginProgress { .. } => "login_progress",
             AppEvent::LoginComplete { .. } => "login_complete",
             AppEvent::PreflightComplete(_) => "preflight_complete",
@@ -2385,12 +2408,11 @@ impl App {
                 self.available_models = available_models.clone();
                 self.current_model_id = current_model_id.clone();
                 self.state = ConnectionState::Connected;
-                // Bind the startup session to whichever tab we own. In the
-                // normal WT-spawned path `self.tab_id` was seeded from
-                // `--owner-tab-id` before ACP init started, so we land
-                // directly under the right GUID. For non-pane invocations
-                // (manual `wta` runs) `self.tab_id` is still None and we
-                // fall back to DEFAULT_TAB_ID.
+                // Show welcome hint on first-ever connect (persisted in state.json)
+                if !welcome_shown_in_state() {
+                    self.show_welcome_hint = true;
+                }
+                // Bind the startup session to whichever tab we own.
                 let bind_tab = self
                     .tab_id
                     .clone()
@@ -2443,42 +2465,46 @@ impl App {
                 let is_auth_error = lower.contains("authentication required")
                     || lower.contains("not logged in")
                     || lower.contains("unauthorized")
-                    || lower.contains("401");
+                    || lower.contains("401")
+                    || lower.contains("apikey is missing")
+                    || lower.contains("api key");
                 if is_auth_error {
-                    tracing::info!("AgentError auth fallback: showing auth screen");
-                    // Create auth info on the fly if not already stashed
-                    if self.auth.is_none() {
-                        // Try to determine agent from the deferred ACP params or default
-                        let agent_cmd = self.deferred_acp.as_ref()
-                            .map(|p| p.agent_cmd.clone())
-                            .unwrap_or_default();
-                        let agent_id = agent_cmd.split_whitespace().next()
-                            .and_then(|exe| {
-                                let name = std::path::Path::new(exe).file_stem()
-                                    .map(|s| s.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| exe.to_string());
-                                Some(name)
-                            })
-                            .unwrap_or_else(|| "copilot".to_string());
-                        let profile = crate::agent_registry::lookup_profile(&agent_id);
-                        let reason = if lower.contains("expired") {
-                            "Authentication expired — please sign in again."
-                        } else if lower.contains("authentication required") {
-                            "Authentication required — please sign in to continue."
-                        } else {
-                            "Authentication failed — please sign in again."
-                        };
-                        self.auth = Some(AuthState {
-                            agent_id: profile.id.to_string(),
-                            agent_name: profile.display_name.to_string(),
-                            auth_hint: profile.auth_hint.to_string(),
-                            login_command: crate::agent_check::build_login_cmd(profile.id),
-                            checking: false,
-                            status_message: reason.to_string(),
-                        });
-                    }
-                    self.mode = AppMode::Auth;
+                    tracing::info!("AgentError auth fallback: showing setup screen");
+                    // Use current_agent_id — set at preflight or agent selection time.
+                    let agent_id = if !self.current_agent_id.is_empty() {
+                        self.current_agent_id.clone()
+                    } else {
+                        "copilot".to_string()
+                    };
+                    tracing::info!("AgentError: resolved agent_id={}", agent_id);
+                    let profile = crate::agent_registry::lookup_profile(&agent_id);
+                    let agent_status = crate::agent_check::check_agent(profile.id);
+                    let all_agents = crate::agent_check::check_all_agents();
+                    let reason = SetupReason::AgentError;
+                    let options = build_setup_options(&reason, Some(&agent_status), &all_agents);
+                    self.mode = AppMode::Setup;
                     self.state = ConnectionState::Disconnected;
+                    self.auth = None;
+                    self.setup = Some(SetupState {
+                        reason,
+                        selected_index: 0,
+                        preflight: PreflightResult {
+                            agent_id: profile.id.to_string(),
+                            display_name: profile.display_name.to_string(),
+                            cli_status: CheckStatus::Passed,
+                            cli_path: None,
+                            auth_status: CheckStatus::Failed("Authentication failed".to_string()),
+                            install_hint: profile.install_hint.to_string(),
+                            install_url: String::new(),
+                            auth_hint: profile.auth_hint.to_string(),
+                        },
+                        install_in_progress: false,
+                        install_log: Vec::new(),
+                        install_error: None,
+                        options,
+                        title: "Sign in required".to_string(),
+                        subtitle: format!("Your agent \"{}\" requires authentication. Sign in to continue.", profile.display_name),
+                    });
                     // Clear error messages
                     let tab = self.current_tab_mut();
                     tab.messages.retain(|m| !matches!(m, ChatMessage::Error(_)));
@@ -2614,10 +2640,14 @@ impl App {
                     let all_agents = crate::agent_check::check_all_agents();
                     let options = build_setup_options(&reason, Some(&current_status), &all_agents);
                     let title = reason.title().to_string();
+                    let subtitle = format!(
+                        "Your default agent \"{}\" is not available. Select an agent or fix the issue.",
+                        result.display_name
+                    );
                     self.mode = AppMode::Setup;
                     self.setup = Some(SetupState {
                         reason,
-                        agents: Vec::new(),
+
                         preflight: result,
                         selected_index: 0,
                         install_in_progress: false,
@@ -2625,7 +2655,7 @@ impl App {
                         install_error: None,
                         options,
                         title,
-                        subtitle: "Fix the issue below to continue".to_string(),
+                        subtitle,
                     });
                 }
             }
@@ -2982,7 +3012,7 @@ impl App {
                     self.wt_notifications.pop_front();
                 }
             }
-            AppEvent::AgentInstallComplete(agents) => {
+            AppEvent::AgentInstallComplete => {
                 // Check if the agent we were trying to install is now available.
                 let agent_id = self.setup.as_ref()
                     .map(|s| s.preflight.agent_id.clone())
@@ -2993,15 +3023,21 @@ impl App {
                     if status.cli_found {
                         // Install succeeded → proceed to connect or auth
                         let profile = crate::agent_registry::lookup_profile_by_id(&agent_id);
+                        let is_fre = self.setup.as_ref()
+                            .map(|s| s.reason == SetupReason::FirstRun)
+                            .unwrap_or(false);
+
                         if crate::agent_check::has_credential(&agent_id) {
-                            // Has credential → connect directly.
-                            // Use restart_tx to tell the ACP supervisor to retry
-                            // with the (now-installed) agent. This reuses the
-                            // original ShellManager + WT pipe from main.rs.
-                            let _ = self.restart_tx.send(RestartRequest {});
+                            // Has credential → connect directly
+                            if is_fre {
+                                self.update_deferred_acp_agent(&agent_id);
+                                self.pending_acp_start = true;
+                            } else {
+                                let new_cmd = self.build_agent_cmd(&agent_id);
+                                let _ = self.restart_tx.send(RestartRequest { agent_cmd: Some(new_cmd) });
+                            }
                             self.mode = AppMode::Chat;
                             self.state = ConnectionState::Connecting("Starting agent...".to_string());
-                            // Clear error messages from the failed first attempt
                             let tab = self.current_tab_mut();
                             tab.messages.retain(|m| !matches!(m, ChatMessage::Error(_)));
                             tab.chat_scroll.reset();
@@ -3016,6 +3052,9 @@ impl App {
                             });
                         } else {
                             // No credential → auth screen
+                            if is_fre {
+                                self.update_deferred_acp_agent(&agent_id);
+                            }
                             self.mode = AppMode::Auth;
                             self.setup = None;
                             self.auth = Some(AuthState {
@@ -3033,7 +3072,6 @@ impl App {
 
                 // Install didn't resolve the issue — stay on setup, refresh options
                 if let Some(ref mut setup) = self.setup {
-                    setup.agents = agents;
                     setup.install_in_progress = false;
                     let all_statuses = crate::agent_check::check_all_agents();
                     let current_status = if !agent_id.is_empty() {
@@ -3069,15 +3107,22 @@ impl App {
                     self.mode = AppMode::Chat;
                     self.setup = None;
                     self.state = ConnectionState::Connecting("Starting agent...".to_string());
-                    // Update ACP command to use the selected agent
                     let agent_id = self.auth.as_ref().map(|a| a.agent_id.clone()).unwrap_or_default();
                     self.update_deferred_acp_agent(&agent_id);
-                    self.pending_acp_start = true;
+                    if self.deferred_acp.is_some() {
+                        self.pending_acp_start = true;
+                    } else {
+                        let new_cmd = self.build_agent_cmd(&agent_id);
+                        let _ = self.restart_tx.send(RestartRequest { agent_cmd: Some(new_cmd) });
+                    }
                     self.auth = None;
                 } else {
                     // Login failed — show auth screen again
                     if let Some(ref mut auth) = self.auth {
                         auth.checking = false;
+                        if !auth.login_command.contains("copilot") {
+                            auth.status_message = "Command copied — run it in another terminal, then press Enter to retry".to_string();
+                        }
                     }
                 }
             }
@@ -3141,10 +3186,42 @@ impl App {
                         }
                     });
                     if let Some((agent_id, login_cmd)) = login_info {
-                        if let Some(ref mut auth) = self.auth {
-                            auth.checking = true;
+                        if login_cmd.contains("copilot") {
+                            // Copilot: auto device-flow sign-in via piped stdio
+                            if let Some(ref mut auth) = self.auth {
+                                auth.checking = true;
+                            }
+                            self.spawn_login(&agent_id, &login_cmd);
+                        } else {
+                            // Non-Copilot agents: copy command to clipboard, re-check credential
+                            #[cfg(windows)]
+                            {
+                                let _ = std::process::Command::new("powershell")
+                                    .args(["-NoProfile", "-Command", &format!("Set-Clipboard '{}'", login_cmd.replace('\'', "''"))])
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn();
+                            }
+
+                            if let Some(ref mut auth) = self.auth {
+                                auth.checking = true;
+                                auth.status_message = String::new();
+                            }
+
+                            // Re-check credential asynchronously
+                            if let Some(ref tx) = self.event_tx {
+                                let tx = tx.clone();
+                                let id = agent_id.clone();
+                                tokio::task::spawn_local(async move {
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        crate::agent_check::has_credential(&id)
+                                    }).await;
+                                    let success = result.unwrap_or(false);
+                                    let _ = tx.send(AppEvent::LoginComplete { agent_id, success });
+                                });
+                            }
                         }
-                        self.spawn_login(&agent_id, &login_cmd);
                     }
                 }
                 KeyCode::Esc => {
@@ -3166,7 +3243,7 @@ impl App {
                             self.mode = AppMode::Setup;
                             self.setup = Some(SetupState {
                                 reason,
-                                agents: Vec::new(),
+        
                                 selected_index: 0,
                                 preflight: PreflightResult {
                                     agent_id: agent_id.clone(),
@@ -3182,8 +3259,8 @@ impl App {
                                 install_log: Vec::new(),
                                 install_error: None,
                                 options,
-                                title: format!("{} needs sign-in", profile.display_name),
-                                subtitle: "Authentication is required to use this agent".to_string(),
+                                title: "Sign in required".to_string(),
+                                subtitle: format!("Your agent \"{}\" requires authentication. Sign in to continue.", profile.display_name),
                             });
                         } else {
                             self.mode = AppMode::Chat;
@@ -3641,6 +3718,10 @@ impl App {
                         "ui_submit",
                         &format!("preview={:?}", prompt.preview()),
                     );
+                    if self.show_welcome_hint {
+                        self.show_welcome_hint = false;
+                        set_welcome_shown_in_state();
+                    }
                     let submitted = SubmittedPrompt {
                         id: prompt.id,
                         text: text.clone(),
@@ -3858,7 +3939,7 @@ impl App {
                     tab.selected_completed_turn_idx = None;
                     tab.session_id = None;
                 }
-                let _ = self.restart_tx.send(RestartRequest);
+                let _ = self.restart_tx.send(RestartRequest { agent_cmd: None });
                 self.publish_agent_status();
             }
         }
@@ -5172,27 +5253,35 @@ impl App {
     /// path. Cheap to call on every state change — the publisher serializes
     /// `wtcli publish` invocations, and an extra one per state transition is
     /// negligible compared to chat traffic.
-    fn publish_agent_status(&self) {
+    fn publish_agent_status(&mut self) {
         let state_str = match &self.state {
             ConnectionState::Connecting(_) => "connecting",
             ConnectionState::Connected => "connected",
             ConnectionState::Failed(_) => "failed",
             ConnectionState::Disconnected => "disconnected",
         };
+        // Include selected_agent only once — when connected after user selection.
+        // This avoids triggering _RebuildAgentStack mid-FRE.
+        let selected = if self.state == ConnectionState::Connected {
+            self.pending_agent_selection.take()
+        } else {
+            None
+        };
+        let mut params = serde_json::json!({
+            "name": self.agent_name,
+            "version": self.agent_version,
+            "model": self.agent_model,
+            "state": state_str,
+            "available_models": self.available_models,
+            "current_model_id": self.current_model_id,
+        });
+        if let Some(agent_id) = selected {
+            params["selected_agent"] = serde_json::Value::String(agent_id);
+        }
         let evt = serde_json::json!({
             "type": "event",
             "method": "agent_status",
-            "params": {
-                "name": self.agent_name,
-                "version": self.agent_version,
-                "model": self.agent_model,
-                "state": state_str,
-                // Empty array (not null/missing) when no models advertised, so
-                // the C++ side can use "array length > 0" as the "show dropdown"
-                // signal without ambiguity.
-                "available_models": self.available_models,
-                "current_model_id": self.current_model_id,
-            }
+            "params": params,
         });
         send_wt_protocol_event(evt.to_string());
     }
@@ -5316,6 +5405,54 @@ fn resolve_agent_cmd(cmd: &str) -> String {
 
     // Fallback: return as-is
     cmd.to_string()
+}
+
+/// Read `agentWelcomeShown` from the packaged app's state.json.
+fn welcome_shown_in_state() -> bool {
+    find_state_json()
+        .and_then(|path| std::fs::read_to_string(&path).ok())
+        .map(|content| content.contains("\"agentWelcomeShown\" : true") || content.contains("\"agentWelcomeShown\":true"))
+        .unwrap_or(false)
+}
+
+/// Set `agentWelcomeShown` to true in state.json using string replacement
+/// to preserve formatting and other fields.
+fn set_welcome_shown_in_state() {
+    let Some(path) = find_state_json() else { return };
+    let Ok(content) = std::fs::read_to_string(&path) else { return };
+
+    let updated = if content.contains("\"agentWelcomeShown\"") {
+        // Replace existing value
+        content
+            .replace("\"agentWelcomeShown\" : false", "\"agentWelcomeShown\" : true")
+            .replace("\"agentWelcomeShown\":false", "\"agentWelcomeShown\" : true")
+    } else if let Some(pos) = content.find('{') {
+        // Insert after opening brace
+        let (before, after) = content.split_at(pos + 1);
+        format!("{}\n\t\"agentWelcomeShown\" : true,{}", before, after)
+    } else {
+        return;
+    };
+    let _ = std::fs::write(&path, &updated);
+}
+
+/// Find the packaged app's state.json.
+fn find_state_json() -> Option<std::path::PathBuf> {
+    let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
+    let packages_dir = std::path::Path::new(&local_app_data).join("Packages");
+    if let Ok(entries) = std::fs::read_dir(&packages_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("IntelligentTerminal_") {
+                let candidate = entry.path().join("LocalState").join("state.json");
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn truncate(s: &str, max: usize) -> String {

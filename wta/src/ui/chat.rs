@@ -137,6 +137,22 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
+    // First-run welcome: shown once until user sends first message
+    if app.show_welcome_hint
+        && app.state == crate::app::ConnectionState::Connected
+    {
+        let mut welcome_lines = vec![
+            Line::from(vec![
+                Span::styled("● ", Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Welcome to Intelligent Terminal!",
+                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ];
+        reversed_lines.extend(welcome_lines.drain(..).rev());
+    }
+
     let lines: Vec<Line> = reversed_lines.into_iter().rev().collect();
 
     let total_lines = lines.len();

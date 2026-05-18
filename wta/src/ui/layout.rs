@@ -86,12 +86,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Expire the transient hint before deciding whether to reserve a row.
     // Cheap and keeps the layout in lockstep with the rest of the draw.
+    // Also show welcome hint as a transient hint on first-ever connect.
     let now = std::time::Instant::now();
-    let hint_visible = app
-        .transient_hint
-        .as_ref()
-        .map(|(_, deadline)| now < *deadline)
-        .unwrap_or(false);
+    let welcome_visible = app.show_welcome_hint
+        && app.state == crate::app::ConnectionState::Connected;
+    let hint_visible = welcome_visible
+        || app
+            .transient_hint
+            .as_ref()
+            .map(|(_, deadline)| now < *deadline)
+            .unwrap_or(false);
     if !hint_visible {
         app.transient_hint = None;
     }
@@ -140,8 +144,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     chat::render(frame, app, h_chat[1]);
     app.sync_rec_scroll_max();
     recommendations::render(frame, app, h_rec[1]);
+
     if hint_visible {
-        if let Some((text, _)) = app.transient_hint.as_ref() {
+        if welcome_visible {
+            // First-run shortcut hint
+            let line = Line::from(Span::styled(
+                "  (Ctrl+Shift+. to show/hide agent pane \u{2022} Ctrl+Alt+/ to show/hide agent session)",
+                Style::default().fg(Color::DarkGray),
+            ));
+            frame.render_widget(line, chunks[3]);
+        } else if let Some((text, _)) = app.transient_hint.as_ref() {
             let line = Line::from(Span::styled(
                 format!("  {}", text),
                 Style::default().fg(Color::DarkGray),

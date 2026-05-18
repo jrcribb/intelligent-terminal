@@ -33,9 +33,11 @@ impl AgentStatus {
     /// User-facing status string for agent list.
     pub fn status_label(&self) -> String {
         if !self.cli_found {
-            "Not found".to_string()
-        } else if self.id == "copilot" {
-            "Installed by default".to_string()
+            if self.id == "copilot" {
+                "Not installed — select to install automatically".to_string()
+            } else {
+                "Not found".to_string()
+            }
         } else {
             "Detected".to_string()
         }
@@ -111,11 +113,21 @@ pub fn has_credential(agent_id: &str) -> bool {
                 .map(|o| !o.stdout.is_empty())
                 .unwrap_or(false)
         }
-        "claude" => home.join(".claude").join(".credentials.json").exists(),
+        "claude" => {
+            let path = home.join(".claude").join(".credentials.json");
+            let exists = path.exists();
+            tracing::debug!(target: "agent_check", path = %path.display(), exists, "claude credential check");
+            exists
+        }
         "codex" => {
             std::env::var("OPENAI_API_KEY").is_ok() || home.join(".codex").exists()
         }
-        "gemini" => true, // InProtocol — always try connect
+        "gemini" => {
+            // Check GEMINI_API_KEY or GOOGLE_API_KEY env var, or OAuth token in ~/.gemini/
+            std::env::var("GEMINI_API_KEY").is_ok()
+                || std::env::var("GOOGLE_API_KEY").is_ok()
+                || home.join(".gemini").exists()
+        }
         _ => false,
     }
 }
@@ -150,10 +162,17 @@ pub fn build_login_cmd(agent_id: &str) -> String {
     let exe_path = find_exe(agent_id)
         .unwrap_or_else(|| agent_id.to_string());
 
+    // Agent-specific login subcommand
+    let subcommand = match agent_id {
+        "codex" => "auth",
+        "gemini" => "auth login",
+        _ => "login",
+    };
+
     if exe_path.contains(' ') {
-        format!("\"{}\" login", exe_path)
+        format!("\"{}\" {}", exe_path, subcommand)
     } else {
-        format!("{} login", exe_path)
+        format!("{} {}", exe_path, subcommand)
     }
 }
 

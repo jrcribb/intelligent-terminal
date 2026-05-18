@@ -60,9 +60,12 @@ pub struct NewSessionForTab {
 /// User-initiated full reconnect of the ACP client. Emitted by the
 /// `/restart` slash command. The ACP client task kills the agent child
 /// process, drops the connection, then respawns the agent and
-/// re-initializes from scratch.
+/// re-initializes from scratch. If `agent_cmd` is set, the supervisor
+/// switches to a different agent on restart.
 #[derive(Debug, Clone, Default)]
-pub struct RestartRequest;
+pub struct RestartRequest {
+    pub agent_cmd: Option<String>,
+}
 
 /// Drop the ACP session binding for a tab WITHOUT immediately creating a
 /// replacement. Emitted by the Ctrl+C×2 close-pane path when the agent
@@ -81,12 +84,13 @@ pub struct DropSessionRequest {
 
 /// How [`run_inner`] terminated. The outer driver in [`run_acp_client`]
 /// uses this to decide whether to respawn the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ExitReason {
     /// Loop exited because all sender halves dropped (process shutdown).
     Done,
     /// `/restart` requested. Outer driver should re-enter `run_inner`.
-    Restart,
+    /// If `agent_cmd` is set, the supervisor should switch to that agent.
+    Restart { agent_cmd: Option<String> },
 }
 
 impl PromptSubmission {
@@ -1474,7 +1478,7 @@ impl acp::Client for WtaClient {
 
 /// Top-level ACP client task: spawn agent, handshake, prompt loop.
 pub async fn run_acp_client(
-    agent_cmd: String,
+    mut agent_cmd: String,
     acp_model_override: Option<String>,
     owner_tab_id: Option<String>,
     event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -1516,8 +1520,13 @@ pub async fn run_acp_client(
                 startup_probe.log("run_acp_client completed");
                 break;
             }
-            Ok(ExitReason::Restart) => {
-                startup_probe.log("run_acp_client restart requested — respawning agent");
+            Ok(ExitReason::Restart { agent_cmd: new_cmd }) => {
+                if let Some(cmd) = new_cmd {
+                    startup_probe.log(&format!("run_acp_client switching agent to: {}", cmd));
+                    agent_cmd = cmd;
+                } else {
+                    startup_probe.log("run_acp_client restart requested — respawning agent");
+                }
                 let _ = event_tx.send(AppEvent::ConnectionStage(
                     "Restarting agent...".to_string(),
                 ));
@@ -1537,10 +1546,18 @@ pub async fn run_acp_client(
                 // the supervisor. Park here listening for /restart so the
                 // user can recover without restarting the whole terminal.
                 match restart_rx.recv().await {
-                    Some(_) => {
-                        startup_probe.log(
-                            "run_acp_client restart requested after failure — respawning agent",
-                        );
+                    Some(req) => {
+                        if let Some(new_cmd) = req.agent_cmd {
+                            startup_probe.log(&format!(
+                                "run_acp_client switching agent: {} -> {}",
+                                agent_cmd, new_cmd
+                            ));
+                            agent_cmd = new_cmd;
+                        } else {
+                            startup_probe.log(
+                                "run_acp_client restart requested after failure — respawning agent",
+                            );
+                        }
                         let _ = event_tx.send(AppEvent::ConnectionStage(
                             "Restarting agent...".to_string(),
                         ));
@@ -1877,8 +1894,8 @@ async fn run_inner(
             biased;
             // /restart: priority over other arms via `biased;` so a
             // queued prompt can't sneak in front of a kill request.
-            Some(_) = restart_rx.recv() => {
-                tracing::info!(target: "acp_restart", "restart requested");
+            Some(req) = restart_rx.recv() => {
+                tracing::info!(target: "acp_restart", "restart requested, new_agent={:?}", req.agent_cmd);
                 if let Some(tx) = kill_req_tx.take() {
                     let _ = tx.send(());
                 }
@@ -1889,7 +1906,7 @@ async fn run_inner(
                 for (_, sig) in signals.drain() {
                     let _ = sig.send(());
                 }
-                break ExitReason::Restart;
+                break ExitReason::Restart { agent_cmd: req.agent_cmd };
             }
             Some(req) = cancel_rx.recv() => {
                 let session_id_str = req.session_id.clone();

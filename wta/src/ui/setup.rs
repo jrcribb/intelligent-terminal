@@ -88,11 +88,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
         let (label, status_text) = match opt {
             SetupOption::SelectAgent { agent } => {
-                let is_installing = setup
-                    .agents
-                    .get(i)
-                    .map(|a| a.status == "Installing...")
-                    .unwrap_or(false);
+                let is_installing = setup.install_in_progress
+                    && agent.can_auto_install()
+                    && !agent.cli_found;
                 let status = if is_installing {
                     format!("  {} Installing...", spinner_char)
                 } else {
@@ -104,24 +102,9 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                 let status = if setup.install_in_progress {
                     format!("  {} installing...", spinner_char)
                 } else {
-                    "  (automatic via winget)".to_string()
+                    "  (Will be installed automatically)".to_string()
                 };
                 (format!("Reinstall {}", display_name), status)
-            }
-            SetupOption::InstallManually {
-                display_name,
-                hint,
-                ..
-            } => {
-                let preview = if hint.len() > 40 {
-                    format!("{}...", &hint[..37])
-                } else {
-                    hint.clone()
-                };
-                (
-                    format!("Install {} manually", display_name),
-                    format!("  ({})", preview),
-                )
             }
             SetupOption::SignIn { display_name, .. } => {
                 (format!("Sign in to {}", display_name), String::new())
@@ -130,11 +113,18 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
                 format!("Switch to {}", agent.display_name),
                 format!("  ({})", agent.status_label()),
             ),
-            SetupOption::Retry => ("Retry connection".to_string(), String::new()),
+            SetupOption::Retry => {
+                let label = match setup.reason {
+                    crate::app::SetupReason::AgentMissing => "Retry detection",
+                    crate::app::SetupReason::AgentError => "I've signed in — retry connection",
+                    _ => "Retry connection",
+                };
+                (label.to_string(), String::new())
+            }
         };
 
-        let is_installing_select = matches!(opt, SetupOption::SelectAgent { agent } if
-            setup.agents.get(i).map(|a| a.status == "Installing...").unwrap_or(false));
+        let is_installing_select = matches!(opt, SetupOption::SelectAgent { ref agent } if
+            setup.install_in_progress && agent.can_auto_install() && !agent.cli_found);
         let is_installing_opt = is_installing_select
             || (matches!(opt, SetupOption::Reinstall { .. }) && setup.install_in_progress);
         let status_style = if is_installing_opt {
