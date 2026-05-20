@@ -4,7 +4,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{rec_card_height, App};
 use crate::coordinator::{OpenTarget, RecommendationChoice, RecommendedAction};
 use crate::theme;
-use crate::ui::card;
+use crate::ui::card::{self, CARD_MIN_SIZE};
 
 /// Render the recommendations panel. Pure: callers (layout.rs) must call
 /// `App::sync_rec_scroll_max` first so `rec_scroll.offset` is already clamped
@@ -29,15 +29,22 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
     let rec_scroll = app.current_tab().rec_scroll.offset;
     let cards_bottom = area.y.saturating_add(area.height);
 
+    // `area` is `h_rec[1]` (post-padding), but `rec_card_height` /
+    // `rec_panel_height` / `sync_rec_scroll_max` all root their wrap math at
+    // `main_area.width` (see `CARD_H_CHROME`). Use the same basis here or
+    // wrap rows go 2 cells narrower at render than at predict, clipping the
+    // bottom card and undercounting `rec_scroll.max`.
+    let panel_width = app.main_area_width();
+
     let mut canvas_top = 0usize;
     for (idx, choice) in recs.choices.iter().enumerate() {
-        let h = rec_card_height(choice, area.width);
+        let h = rec_card_height(choice, panel_width);
         if canvas_top >= rec_scroll {
             let card_h = h.saturating_sub(1) as u16; // last canvas row is inter-card gap
             let y = area.y + (canvas_top - rec_scroll) as u16;
             let available = cards_bottom.saturating_sub(y);
-            if available < 4 {
-                break; // render_card bails below 4 — nothing useful to draw
+            if available < CARD_MIN_SIZE {
+                break; // card shell bails below this — nothing useful to draw
             }
             let render_h = card_h.min(available);
             // Cards use the full h_rec[1] width so their left border sits in
@@ -76,7 +83,7 @@ fn render_card(
     choice: &RecommendationChoice,
     idx: usize,
 ) {
-    if area.width < 4 || area.height < 4 {
+    if area.width < CARD_MIN_SIZE || area.height < CARD_MIN_SIZE {
         return;
     }
 
