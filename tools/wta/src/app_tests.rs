@@ -2629,6 +2629,8 @@ fn pack_replayed_turns_keep_the_whole_prompt() {
 
 #[test]
 fn pack_replayed_recommendation_reuses_live_turn_formatting() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
     let mut tab = TabSession::default();
     tab.messages = vec![
         ChatMessage::User(
@@ -2668,7 +2670,7 @@ get time"#
     assert_eq!(
         turn.details,
         vec![ChatMessage::Agent(
-            "Suggested 1 option:\n  ✓ 1. Run: Get-Date -Format 'HH:mm:ss'".to_string()
+            "Get-Date -Format 'HH:mm:ss'".to_string()
         )]
     );
 }
@@ -16030,6 +16032,8 @@ fn stage_direct_proposal(
 
 #[test]
 fn direct_proposal_confirm_resolves_waiting_cli() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
     let mut app = test_app();
     let (recommendation_tx, mut recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
     app.recommendation_tx = recommendation_tx;
@@ -16062,10 +16066,226 @@ fn direct_proposal_confirm_resolves_waiting_cli() {
     });
     let tab = app.session_tab(session_id);
     assert_eq!(tab.completed_turns.len(), 1);
-    assert!(tab.completed_turns[0]
-        .trailing_marker
-        .as_deref()
-        .is_some_and(|marker| marker.contains("executed")));
+    assert_eq!(
+        tab.completed_turns[0].details.last(),
+        Some(&ChatMessage::Agent("Run: Restart-Service foo".into()))
+    );
+    assert_eq!(tab.completed_turns[0].trailing_marker, None);
+}
+
+#[test]
+fn executing_committed_recommendation_keeps_compact_summary() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    let (recommendation_tx, _recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.recommendation_tx = recommendation_tx;
+    let manager = std::sync::Arc::new(
+        crate::agent_tools::action_proposal::channel::ProposalChannelManager::new(),
+    );
+    app.set_proposal_channels(std::sync::Arc::clone(&manager));
+    let session_id = "direct-confirm-after-end";
+    stage_proposal_session(&mut app, session_id);
+    submit_proposal_prompt(&mut app, session_id);
+    let (proposal_id, _final_rx) = stage_direct_proposal(&mut app, &manager, session_id);
+    let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+    app.handle_event(AppEvent::DirectTerminalActionProposalCommit {
+        proposal_id,
+        responder: commit_tx,
+    });
+    assert!(commit_rx.blocking_recv().unwrap());
+
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: session_id.into(),
+    });
+    assert!(matches!(
+        app.session_tab(session_id).completed_turns[0].details.last(),
+        Some(ChatMessage::Agent(text)) if text == "Restart-Service foo"
+    ));
+
+    app.turn_execute_card(session_id);
+
+    let turn = &app.session_tab(session_id).completed_turns[0];
+    assert_eq!(
+        turn.details.last(),
+        Some(&ChatMessage::Agent("Run: Restart-Service foo".into()))
+    );
+    assert_eq!(turn.trailing_marker, None);
+
+    let rendered = render_to_text(&mut app, 80, 24);
+    assert!(rendered.contains("Run: Restart-Service foo"));
+    assert!(!rendered.contains("Suggested 1 option:"));
+    assert!(!rendered.contains("1. Run:"));
+    assert!(!rendered.contains("executed:"));
+}
+
+#[test]
+fn direct_proposal_history_distinguishes_localized_insert_and_run() {
+    let _locale = crate::test_support::lock_locale();
+    for (locale, run_label, insert_label) in [("en-US", "Run", "Insert"), ("zh-CN", "运行", "插入")]
+    {
+        rust_i18n::set_locale(locale);
+        for insert_only in [false, true] {
+            for end_before_action in [false, true] {
+                let mut app = test_app();
+                let (recommendation_tx, mut recommendation_rx) =
+                    tokio::sync::mpsc::unbounded_channel();
+                app.recommendation_tx = recommendation_tx;
+                let manager = std::sync::Arc::new(
+                    crate::agent_tools::action_proposal::channel::ProposalChannelManager::new(),
+                );
+                app.set_proposal_channels(std::sync::Arc::clone(&manager));
+                let session_id = "localized-action";
+                stage_proposal_session(&mut app, session_id);
+                submit_proposal_prompt(&mut app, session_id);
+                let (proposal_id, final_rx) = stage_direct_proposal(&mut app, &manager, session_id);
+                let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+                app.handle_event(AppEvent::DirectTerminalActionProposalCommit {
+                    proposal_id,
+                    responder: commit_tx,
+                });
+                assert!(commit_rx.blocking_recv().unwrap());
+                if end_before_action {
+                    app.turn_close(session_id);
+                }
+                app.session_tab_mut(session_id).selected_button = usize::from(insert_only);
+                app.turn_execute_card(session_id);
+                assert_eq!(
+                    recommendation_rx.try_recv().unwrap().insert_only,
+                    insert_only
+                );
+                assert_eq!(
+                    final_rx.blocking_recv().unwrap(),
+                    crate::agent_tools::action_proposal::channel::ProposalFinalStatus::Confirmed
+                );
+                if !end_before_action {
+                    app.turn_close(session_id);
+                }
+
+                let label = if insert_only { insert_label } else { run_label };
+                let expected = format!("{label}: Restart-Service foo");
+                let turns = &app.session_tab(session_id).completed_turns;
+                assert_eq!(turns.len(), 1);
+                assert_eq!(turns[0].details, vec![ChatMessage::Agent(expected.clone())]);
+                assert_eq!(turns[0].trailing_marker, None);
+                let rendered = render_to_text(&mut app, 80, 24);
+                // TestBackend includes blank continuation cells after wide glyphs.
+                let compact_rendered: String =
+                    rendered.chars().filter(|c| !c.is_whitespace()).collect();
+                let compact_expected: String =
+                    expected.chars().filter(|c| !c.is_whitespace()).collect();
+                assert!(
+                    compact_rendered.contains(&compact_expected),
+                    "{locale}: {rendered}"
+                );
+                assert!(!rendered.contains("Suggested"));
+                assert!(!rendered.contains("executed:"));
+            }
+        }
+    }
+}
+
+#[test]
+fn direct_proposal_cancel_history_marks_action_not_title() {
+    let _locale = crate::test_support::lock_locale();
+    for (locale, canceled) in [("en-US", "(canceled)"), ("zh-CN", "(已取消)")] {
+        rust_i18n::set_locale(locale);
+        for end_before_cancel in [false, true] {
+            for has_prose in [false, true] {
+                let mut app = test_app();
+                let (recommendation_tx, mut recommendation_rx) =
+                    tokio::sync::mpsc::unbounded_channel();
+                app.recommendation_tx = recommendation_tx;
+                let manager = std::sync::Arc::new(
+                    crate::agent_tools::action_proposal::channel::ProposalChannelManager::new(),
+                );
+                app.set_proposal_channels(std::sync::Arc::clone(&manager));
+                let session_id = "compact-cancel";
+                stage_proposal_session(&mut app, session_id);
+                submit_proposal_prompt(&mut app, session_id);
+                let (proposal_id, final_rx) = stage_direct_proposal(&mut app, &manager, session_id);
+                let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+                app.handle_event(AppEvent::DirectTerminalActionProposalCommit {
+                    proposal_id,
+                    responder: commit_tx,
+                });
+                assert!(commit_rx.blocking_recv().unwrap());
+                if has_prose {
+                    app.handle_event(AppEvent::AgentMessageChunk {
+                        session_id: session_id.into(),
+                        text: "Service explanation.".into(),
+                    });
+                }
+                if end_before_cancel {
+                    app.turn_close(session_id);
+                }
+                app.turn_cancel(session_id);
+                assert_eq!(
+                    final_rx.blocking_recv().unwrap(),
+                    crate::agent_tools::action_proposal::channel::ProposalFinalStatus::Cancelled
+                );
+                assert!(recommendation_rx.try_recv().is_err());
+                app.handle_event(AppEvent::PromptCancellationSettled {
+                    prompt_id: 99,
+                    started: true,
+                });
+                app.turn_cancel(session_id);
+
+                let turns = &app.session_tab(session_id).completed_turns;
+                assert_eq!(turns.len(), 1);
+                let mut expected_details = if has_prose {
+                    vec![ChatMessage::Agent("Service explanation.".into())]
+                } else {
+                    Vec::new()
+                };
+                let action = format!("Restart-Service foo {canceled}");
+                expected_details.push(ChatMessage::Agent(action.clone()));
+                assert_eq!(turns[0].details, expected_details);
+                assert_eq!(turns[0].trailing_marker, None);
+                assert!(!turns[0].prompt.contains(canceled));
+                let rendered = render_to_text(&mut app, 100, 30);
+                let compact: String = rendered.chars().filter(|c| !c.is_whitespace()).collect();
+                let compact_action: String =
+                    action.chars().filter(|c| !c.is_whitespace()).collect();
+                assert!(compact.contains(&compact_action), "{locale}: {rendered}");
+                assert!(!rendered.contains("Suggested"));
+                for label in ["Run:", "Insert:", "运行:", "插入:"] {
+                    assert!(!compact.contains(label), "{locale}: {rendered}");
+                }
+                assert!(!rendered.contains("1. Run:"));
+                assert!(!rendered.contains('✓'));
+            }
+        }
+    }
+}
+
+#[test]
+fn replayed_recommendations_do_not_assume_run_or_insert() {
+    let _locale = crate::test_support::lock_locale();
+    for locale in ["en-US", "zh-CN"] {
+        rust_i18n::set_locale(locale);
+        let mut tab = TabSession::default();
+        tab.messages = vec![
+            ChatMessage::User("show dates".into()),
+            ChatMessage::Agent(
+                serde_json::json!({
+                    "recommended_choice": 2,
+                    "choices": [
+                        {"choice": 1, "title": "Local date", "rationale": "",
+                         "actions": [{"type": "send", "parent": "", "input": "Get-Date"}]},
+                        {"choice": 2, "title": "UTC date", "rationale": "",
+                         "actions": [{"type": "send", "parent": "", "input": "Get-Date -AsUTC"}]}
+                    ]
+                })
+                .to_string(),
+            ),
+        ];
+        tab.pack_replayed_messages_into_turns();
+        assert_eq!(
+            tab.completed_turns[0].details,
+            vec![ChatMessage::Agent("Get-Date\nGet-Date -AsUTC".into())]
+        );
+    }
 }
 
 #[test]
@@ -16144,6 +16364,8 @@ fn direct_proposal_defers_history_until_tool_updates_finish() {
 
 #[test]
 fn cancel_after_direct_proposal_commits_trailing_transcript_once() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
     let mut app = test_app();
     let manager = std::sync::Arc::new(
         crate::agent_tools::action_proposal::channel::ProposalChannelManager::new(),
@@ -16177,10 +16399,11 @@ fn cancel_after_direct_proposal_commits_trailing_transcript_once() {
     assert!(tab.completed_turns[0].details.iter().any(
         |detail| matches!(detail, ChatMessage::Agent(text) if text == "Trailing explanation.")
     ));
-    assert!(tab.completed_turns[0]
-        .trailing_marker
-        .as_deref()
-        .is_some_and(|marker| marker.contains("canceled")));
+    assert_eq!(tab.completed_turns[0].trailing_marker, None);
+    assert_eq!(
+        tab.completed_turns[0].details.last(),
+        Some(&ChatMessage::Agent("Restart-Service foo (canceled)".into()))
+    );
     assert_eq!(
         final_rx.blocking_recv().unwrap(),
         crate::agent_tools::action_proposal::channel::ProposalFinalStatus::Cancelled
