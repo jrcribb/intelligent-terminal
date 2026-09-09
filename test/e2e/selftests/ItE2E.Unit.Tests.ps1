@@ -104,6 +104,144 @@ Describe 'Localized WTA text matching' -Tag 'Unit' {
     }
 }
 
+Describe 'Terminal action proposal permission gates' -Tag 'Unit' {
+    BeforeAll {
+        Mock Wait-Until -ModuleName ItE2E { param($Condition) & $Condition }
+        Mock Get-AgentPaneSession -ModuleName ItE2E {
+            [pscustomobject]@{ PaneSessionId = 'source-pane'; AcpSessionId = 'session-1'; HelperProcessId = 123 }
+        }
+        Mock Get-ItLogText -ModuleName ItE2E {
+            @'
+permission_ui: permission queued for user selection request={"session_id":"session-1","tool_call_id":"lookup-1","kind":"command_lookup"}
+permission_ui: current permission snapshot={"session_id":"session-1","tool_call_id":"lookup-1"}
+'@
+        }
+        Mock Get-AgentPaneText -ModuleName ItE2E { 'wta resolve-command gti --shell pwsh [Y] Allow [N] Deny' }
+        Mock Send-AgentKey -ModuleName ItE2E { throw 'Waiting must not select a permission option' }
+    }
+
+    It 'returns an explicit command lookup permission without approving it' {
+        $gate = Wait-TerminalActionProposal -App @{} -PaneSessionId 'source-pane' -ReturnOnPermission
+        $gate.Mode | Should -Be 'Permission'
+        $gate.Ready | Should -BeFalse
+        Should -Invoke Get-AgentPaneText -ModuleName ItE2E -Times 1 -Exactly -ParameterFilter { $PaneSessionId -eq 'source-pane' }
+        Should -Invoke Send-AgentKey -ModuleName ItE2E -Times 0
+        Should -Invoke Get-ItLogText -ModuleName ItE2E -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'wta-main_helper-123.log' -and -not $SinceStart
+        }
+    }
+
+    It 'does not return command lookup permissions without opt-in' {
+        Wait-TerminalActionProposal -App @{} | Should -BeNullOrEmpty
+    }
+
+    It 'does not treat unrelated tool permissions as proposals' {
+        Mock Get-ItLogText -ModuleName ItE2E {
+            @'
+permission_ui: permission queued for user selection request={"session_id":"session-1","tool_call_id":"lookup-1","kind":"command_lookup"}
+permission_ui: permission queued for user selection request={"session_id":"session-1","tool_call_id":"other-1","kind":"other"}
+permission_ui: current permission snapshot={"session_id":"session-1","tool_call_id":"other-1"}
+'@
+        }
+        Wait-TerminalActionProposal -App @{} -ReturnOnPermission | Should -BeNullOrEmpty
+    }
+
+    It 'requires rendered permission choices rather than command text alone' {
+        Mock Get-AgentPaneText -ModuleName ItE2E { 'Completed wta resolve-command gti' }
+        Wait-TerminalActionProposal -App @{} -ReturnOnPermission | Should -BeNullOrEmpty
+    }
+
+    It 'still recognizes the session MCP permission gate' {
+        Mock Get-ItLogText -ModuleName ItE2E {
+            @'
+permission_ui: permission queued for user selection request={"session_id":"session-1","tool_call_id":"mcp-1","kind":"session_mcp"}
+permission_ui: current permission snapshot={"session_id":"session-1","tool_call_id":"mcp-1"}
+'@
+        }
+        Mock Get-AgentPaneText -ModuleName ItE2E { 'Run command in current shell [Y] Allow [N] Deny' }
+        (Wait-TerminalActionProposal -App @{} -ReturnOnPermission).Mode | Should -Be 'Permission'
+    }
+
+    It 'still recognizes a rendered recommendation without a permission request' {
+        Mock Get-ItLogText -ModuleName ItE2E { '' }
+        Mock Get-AgentPaneText -ModuleName ItE2E { 'Insert in Terminal' }
+        $gate = Wait-TerminalActionProposal -App @{}
+        $gate.Mode | Should -Be 'Mcp'
+        $gate.Ready | Should -BeTrue
+    }
+
+    It 'accepts a request already pending before waiting starts' {
+        $gate = Wait-TerminalActionProposal -App @{} -ReturnOnPermission
+        $gate.ToolCallId | Should -Be 'lookup-1'
+        $gate.AcpSessionId | Should -Be 'session-1'
+    }
+
+    It 'ignores a cleared <Reason> request despite old resolver text' -TestCases @(
+        @{ Reason = 'resolved' }, @{ Reason = 'rejected' }, @{ Reason = 'cancelled' }, @{ Reason = 'turn-ended' }
+    ) {
+        Mock Get-ItLogText -ModuleName ItE2E {
+            @'
+permission_ui: permission queued for user selection request={"session_id":"session-1","tool_call_id":"lookup-1","kind":"command_lookup"}
+permission_ui: current permission snapshot={"session_id":"session-1","tool_call_id":"lookup-1"}
+permission_ui: current permission snapshot={"session_id":"session-1","tool_call_id":null}
+'@
+        }
+        Wait-TerminalActionProposal -App @{} -ReturnOnPermission | Should -BeNullOrEmpty
+    }
+
+    It 'ignores old MCP validation that was auto-approved or rejected' {
+        Mock Get-ItLogText -ModuleName ItE2E {
+            'session_mcp_permission: validating session MCP permission before user selection'
+        }
+        Wait-TerminalActionProposal -App @{} -ReturnOnPermission | Should -BeNullOrEmpty
+    }
+
+    It 'ignores a previous session in the same helper' {
+        Mock Get-ItLogText -ModuleName ItE2E {
+            @'
+permission_ui: permission queued for user selection request={"session_id":"old-session","tool_call_id":"lookup-1","kind":"command_lookup"}
+permission_ui: current permission snapshot={"session_id":"old-session","tool_call_id":"lookup-1"}
+'@
+        }
+        Wait-TerminalActionProposal -App @{} -ReturnOnPermission | Should -BeNullOrEmpty
+    }
+
+    It 'does not read another helpers permission evidence' {
+        Mock Get-ItLogText -ModuleName ItE2E {
+            param($Name)
+            if ($Name -ne 'wta-main_helper-123.log') { throw 'Cross-helper log read' }
+            ''
+        }
+        Wait-TerminalActionProposal -App @{} -PaneSessionId 'source-pane' -ReturnOnPermission | Should -BeNullOrEmpty
+    }
+
+    It 'pins the implicit target across polls' {
+        Mock Wait-Until -ModuleName ItE2E {
+            param($Condition, $Because)
+            if ($Because -eq 'the target agent pane') { return & $Condition }
+            $null = & $Condition
+            & $Condition
+        }
+        $gate = Wait-TerminalActionProposal -App @{} -ReturnOnPermission
+        $gate.PaneSessionId | Should -Be 'source-pane'
+        Should -Invoke Get-AgentPaneSession -ModuleName ItE2E -Times 1 -Exactly -ParameterFilter { -not $PaneSessionId }
+        Should -Invoke Get-AgentPaneSession -ModuleName ItE2E -Times 2 -Exactly -ParameterFilter { $PaneSessionId -eq 'source-pane' }
+    }
+
+    It 'does not let a stale legacy process gate hide a target card' {
+        Mock Get-ItLogText -ModuleName ItE2E { 'proposal_permission: armed=true' }
+        Mock Get-PendingTerminalActionProposal -ModuleName ItE2E { throw 'Global legacy process lookup' }
+        Mock Get-AgentPaneText -ModuleName ItE2E { 'Insert in Terminal' }
+        (Wait-TerminalActionProposal -App @{}).Ready | Should -BeTrue
+        Should -Invoke Get-PendingTerminalActionProposal -ModuleName ItE2E -Times 0
+    }
+
+    It 'requires a target card even when legacy transport was armed elsewhere' {
+        Mock Get-ItLogText -ModuleName ItE2E { 'proposal_permission: armed=true' }
+        Wait-TerminalActionProposal -App @{} -ReturnOnPermission | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Agent settings cleanup' -Tag 'Unit' {
     It 'removes showTokenUsageAndCost while preserving profiles' {
         $settingsPath = Join-Path $TestDrive 'settings.json'

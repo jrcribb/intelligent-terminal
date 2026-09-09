@@ -1196,6 +1196,127 @@ enum HiddenToolCall {
     Other,
 }
 
+// Diagnostic classification only: never grants permission or logs command contents.
+fn is_command_lookup_permission(command: &str) -> bool {
+    let command = command
+        .trim()
+        .strip_prefix('&')
+        .unwrap_or(command.trim())
+        .trim();
+    // Quoted paths can contain shell metacharacters. Reject operators outside
+    // quotes and command substitution inside double quotes, not single-quoted literals.
+    let mut quote = None;
+    let mut executable_end = None;
+    let mut chars = command.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if matches!(ch, '\n' | '\r')
+            || (quote != Some('\'')
+                && (ch == '`' || (ch == '$' && chars.peek().is_some_and(|(_, next)| *next == '('))))
+        {
+            return false;
+        }
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
+                    chars.next();
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            ';' | '|' | '&' | '>' | '<' | '(' | ')' | '{' | '}' => return false,
+            ch if ch.is_whitespace() => {
+                executable_end.get_or_insert(index);
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() {
+        return false;
+    }
+    let Some(end) = executable_end else {
+        return false;
+    };
+    let (executable, rest) = command.split_at(end);
+    let executable = if let Some(quote) = executable
+        .chars()
+        .next()
+        .filter(|c| *c == '"' || *c == '\'')
+    {
+        let Some(executable) = executable[1..].strip_suffix(quote) else {
+            return false;
+        };
+        executable
+    } else {
+        executable
+    };
+    let executable = executable.rsplit(['\\', '/']).next().unwrap_or(executable);
+    (executable.eq_ignore_ascii_case("wta")
+        || executable.eq_ignore_ascii_case("wta.exe")
+        || executable.eq_ignore_ascii_case("$env:WTA_CLI_PATH")
+        || executable == "$WTA_CLI_PATH")
+        && rest.split_whitespace().next() == Some("resolve-command")
+}
+
+#[test]
+fn command_lookup_permission_diagnostic_requires_an_invocation() {
+    for command in [
+        "wta resolve-command gti",
+        "& \"$env:WTA_CLI_PATH\" resolve-command gti",
+        "\"C:\\Program Files\\IT\\wta.exe\" resolve-command gti",
+    ] {
+        assert!(is_command_lookup_permission(command), "{command}");
+    }
+    for command in [
+        "echo resolve-command",
+        "wta run-command resolve-command",
+        "other.exe resolve-command gti",
+        "wta resolve-command-history",
+        "wta resolve-command gti; unrelated-command",
+        "wta resolve-command $(unrelated-command)",
+        "wta resolve-command gti | unrelated-command",
+        "'unterminated",
+    ] {
+        assert!(!is_command_lookup_permission(command), "{command}");
+    }
+}
+
+#[test]
+fn command_lookup_permission_preserves_quoted_path_literals() {
+    for command in [
+        r#"& 'wta.exe' resolve-command gti --cwd 'C:\R&D\src' --json"#,
+        r#"& "C:\R&D tools\wta.exe" resolve-command gti --cwd "C:\R&D\src""#,
+        r#"& 'wta.exe' resolve-command gti --cwd 'C:\src;archive' --json"#,
+        r#"& 'C:\owner''s\R&D\wta.exe' resolve-command gti --cwd 'C:\owner''s\src'"#,
+        r#"& 'wta.exe' resolve-command gti --cwd "C:\owner's\R&D""#,
+        r#"& 'wta.exe' resolve-command gti --cwd 'C:\$(archive)&src' --json"#,
+        r#"& 'wta.exe' resolve-command gti --cwd 'C:\src`archive' --json"#,
+    ] {
+        assert!(is_command_lookup_permission(command), "{command}");
+    }
+}
+
+#[test]
+fn command_lookup_permission_rejects_expressions_and_unbalanced_quotes() {
+    for command in [
+        r#"& 'wta.exe' resolve-command gti --cwd 'C:\R&D' & unrelated-command"#,
+        r#"& 'wta.exe' resolve-command gti --cwd "C:\R&D"; unrelated-command"#,
+        r#"& 'wta.exe' resolve-command gti --cwd 'C:\R&D' | unrelated-command"#,
+        r#"& 'wta.exe' resolve-command gti --cwd "$(unrelated-command)""#,
+        r#"& 'wta.exe' resolve-command (unrelated-command)"#,
+        r#"& 'wta.exe' resolve-command gti --cwd 'C:\owner''s"#,
+        r#"& 'wta.exe' resolve-command gti --cwd "C:\R&D"#,
+        concat!("& 'wta.exe'", "resolve-command gti"),
+        "wta resolve-command gti\nunrelated-command",
+        "wta resolve-command gti > output.txt",
+    ] {
+        assert!(!is_command_lookup_permission(command), "{command}");
+    }
+}
+
 fn looks_like_proposal_command(command: &str) -> bool {
     fn segment_invokes_proposal(segment: &str) -> bool {
         let segment = segment.trim_start();
@@ -1508,6 +1629,24 @@ impl WtaClient {
             .collect();
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+
+        tracing::info!(
+            target: "permission_ui",
+            request = %serde_json::json!({
+                "session_id": session_id,
+                "tool_call_id": tool_call_id,
+                "kind": if matches!(session_mcp_tool, Some(SessionMcpTool::TerminalAction(_))) {
+                    "session_mcp"
+                } else if target_hint.as_ref().is_some_and(|(command, is_command)| {
+                    *is_command && is_command_lookup_permission(command)
+                }) {
+                    "command_lookup"
+                } else {
+                    "other"
+                },
+            }),
+            "permission queued for user selection"
+        );
 
         let (target, target_is_command) = match target_hint {
             Some((text, is_command)) => (Some(text), is_command),

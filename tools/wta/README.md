@@ -42,6 +42,15 @@ Terminal over the COM protocol; `resolve-command` inspects the user's real,
 shell-context-selected sources (active working directory, host PATH and, for
 PowerShell, the profile-loaded command environment).
 
+Autofix sends the failing command's context without pre-querying similar command
+names. Its prompt advertises `wta resolve-command` for agent-initiated diagnosis,
+using the failing pane's shell and working directory. Command enumeration is
+uncached and runs only when requested; there is no background refresh or
+startup/tab-selection prewarming. Query failures or unsupported shell contexts
+are not evidence that a command is missing. The prompt directs agents to propose
+obvious typos in familiar commands (such as `gti status` -> `git status`) without
+lookup, while using local evidence for unfamiliar commands or ambiguous corrections.
+
 The packaged app registers `wta.exe` as an App Execution Alias. Before spawning
 the host agent, WTA puts the current package family's alias directory first on
 `PATH`; unpackaged builds use the running binary's directory. Agent prompts can
