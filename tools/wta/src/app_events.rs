@@ -28,6 +28,32 @@ struct AgentReconnectWire {
 }
 
 impl App {
+    pub(super) fn owns_restored_bindings_notification(
+        &self,
+        tab_id: Option<&str>,
+        params: &serde_json::Value,
+    ) -> bool {
+        self.owner_tab_id.is_some()
+            && self.window_id.is_some()
+            && tab_id == self.owner_tab_id.as_deref()
+            && params.get("window_id").and_then(|v| v.as_str()) == self.window_id.as_deref()
+    }
+
+    pub(super) fn restored_session_bindings_request(&self) -> Option<String> {
+        Some(
+            serde_json::json!({
+                "type": "event",
+                "method": "pane_agent_session_changed",
+                "params": {
+                    "event": "restore_bindings_requested",
+                    "tab_id": self.owner_tab_id.as_deref()?,
+                    "window_id": self.window_id.as_deref()?
+                }
+            })
+            .to_string(),
+        )
+    }
+
     fn arm_auth_recovery_timeout(
         &self,
         agent_id: String,
@@ -2263,6 +2289,25 @@ impl App {
                 // (`wt_event_rx: received event`).
                 tracing::trace!(target: "autofix", method = %method, pane_id = %pane_id, tab_id = ?tab_id, self_pane_id = ?self.pane_id, "WtEvent");
 
+                if method == "wt_listener_ready" || method == "restore_bindings_available" {
+                    // Availability is scoped to the owning helper. A missed
+                    // notification is covered by the next real subscription.
+                    if method == "restore_bindings_available"
+                        && !self.owns_restored_bindings_notification(tab_id.as_deref(), &params)
+                    {
+                        return;
+                    }
+                    if let Some(request) = self.restored_session_bindings_request() {
+                        send_wt_protocol_event(request);
+                    } else {
+                        tracing::warn!(
+                            target: "session_hook",
+                            "cannot request restored bindings without helper tab and window identity"
+                        );
+                    }
+                    return;
+                }
+
                 // Hook bridge events: fire-and-forget into the agent registry
                 // so the agent session view stays current. Unrelated to autofix /
                 // tab routing; runs before the same-pane skip because we want
@@ -2293,6 +2338,18 @@ impl App {
                 }
 
                 if method == "session_born_bound" {
+                    // Restored births are delivered to the one helper whose
+                    // subscription was acknowledged, not forwarded by every tab.
+                    if tab_id
+                        .as_deref()
+                        .is_some_and(|tab| self.owner_tab_id.as_deref() != Some(tab))
+                        || params
+                            .get("window_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|window| self.window_id.as_deref() != Some(window))
+                    {
+                        return;
+                    }
                     let agent_session_id = params
                         .get("agent_session_id")
                         .and_then(|value| value.as_str())
