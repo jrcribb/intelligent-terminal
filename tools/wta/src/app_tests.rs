@@ -16117,6 +16117,1249 @@ fn active_tool_disclosure_anchors_header_and_can_scroll_wrapped_details() {
     assert!(!app.current_tab().completed_tool_call_expanded("one"));
 }
 
+fn reading_rows(rendered: &str, marker: &str) -> Vec<(usize, String)> {
+    let rows = rendered
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(marker))
+        .take(5)
+        .map(|(row, line)| (row, line.trim_end_matches([' ', '│', '┃']).to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 5, "expected readable rows:\n{rendered}");
+    rows
+}
+
+fn reading_test_app() -> App {
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "reading position");
+    app.handle_event(AppEvent::AgentMessageChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (0..90).map(|index| format!("READ_{index:03}\n")).collect(),
+    });
+    app.current_tab_mut().reveal_chars = usize::MAX;
+    render_to_text(&mut app, 48, 20);
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    render_to_text(&mut app, 48, 20);
+    app
+}
+
+fn reading_cleanup_errors(app: &mut App, path: &str) {
+    app.current_agent_source = crate::agent_source::AgentSource::Wsl {
+        distro: "test-distro".into(),
+    };
+    let failure = crate::protocol::acp::failure::AgentFailure::AuthRequired {
+        message: "auth".into(),
+    };
+    match path {
+        "error" => app.handle_event(AppEvent::AgentError {
+            session_id: None,
+            failure,
+            message: "auth".into(),
+        }),
+        "recovery" => app.handle_event(AppEvent::PostLoginAuthRecovery {
+            failure,
+            tab_id: None,
+            agent_id: "copilot".into(),
+        }),
+        "timeout" => {
+            app.state = ConnectionState::Connecting("reconnecting".into());
+            app.auth_recovery_state = AuthRecoveryState::Connecting;
+            app.handle_event(AppEvent::AuthRecoveryTimedOut {
+                agent_id: "copilot".into(),
+                generation: app.auth_recovery_generation,
+            });
+        }
+        _ => unreachable!(),
+    }
+    if path != "recovery" {
+        assert!(matches!(app.mode, AppMode::Setup));
+    }
+    // Resume rendering the retained chat without starting a live connection.
+    app.mode = AppMode::Chat;
+    app.state = ConnectionState::Connected;
+    app.setup = None;
+}
+
+#[test]
+fn chat_reading_position_error_cleanup_preserves_visible_message() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    for path in ["error", "recovery", "timeout"] {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        app.current_tab_mut().messages.extend([
+            ChatMessage::Error("obsolete error".into()),
+            ChatMessage::System(
+                (0..90)
+                    .map(|i| format!("KEEP_{i:03}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            ChatMessage::System("later message".into()),
+        ]);
+        render_to_text(&mut app, 48, 20);
+        app.current_tab_mut().chat_scroll.by(30);
+        let before = reading_rows(&render_to_text(&mut app, 48, 20), "KEEP_");
+        reading_cleanup_errors(&mut app, path);
+        for _ in 0..3 {
+            assert_eq!(
+                reading_rows(&render_to_text(&mut app, 48, 20), "KEEP_"),
+                before,
+                "{path}"
+            );
+        }
+    }
+}
+
+#[test]
+fn chat_reading_position_error_cleanup_clamps_deleted_target() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    app.current_tab_mut().messages.extend([
+        ChatMessage::Error(
+            (0..90)
+                .map(|i| format!("ERROR_{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        ChatMessage::System(
+            (0..90)
+                .map(|i| format!("SURVIVOR_{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    ]);
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(110);
+    assert!(render_to_text(&mut app, 48, 20).contains("ERROR_"));
+    reading_cleanup_errors(&mut app, "error");
+    let after = render_to_text(&mut app, 48, 20);
+    assert!(
+        after.lines().next().unwrap().contains("SURVIVOR_000"),
+        "{after}"
+    );
+    assert_eq!(render_to_text(&mut app, 48, 20), after);
+}
+
+#[test]
+fn chat_reading_position_error_cleanup_preserves_thought_source() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    for path in ["error", "recovery", "timeout"] {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        app.current_tab_mut()
+            .messages
+            .push(ChatMessage::Error("obsolete".into()));
+        app.current_tab_mut().append_thought_chunk(
+            &(0..500)
+                .map(|i| format!("THINK_{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        render_to_text(&mut app, 48, 20);
+        app.current_tab_mut().chat_scroll.by(130);
+        let before = reading_rows(&render_to_text(&mut app, 48, 20), "THINK_");
+        let source = app
+            .current_tab()
+            .chat_reading_position
+            .unwrap()
+            .thought_source
+            .unwrap();
+        reading_cleanup_errors(&mut app, path);
+        assert_eq!(
+            app.current_tab()
+                .chat_reading_position
+                .unwrap()
+                .thought_source,
+            Some(source)
+        );
+        app.current_tab_mut().append_thought_chunk(
+            &std::iter::once(String::new())
+                .chain((500..510).map(|i| format!("THINK_{i:03}")))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                reading_rows(&render_to_text(&mut app, 48, 20), "THINK_"),
+                before,
+                "{path}"
+            );
+        }
+        let retained = app
+            .current_tab()
+            .chat_reading_position
+            .unwrap()
+            .thought_source
+            .unwrap();
+        assert_eq!(retained.0, source.0);
+        assert!(retained.1 < source.1);
+        app.current_tab_mut().retain_current_messages(|_| false);
+        assert!(app.current_tab().chat_reading_position.is_none());
+        app.current_tab_mut().append_thought_chunk(
+            &(0..80)
+                .map(|i| format!("FRESH_{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(app.current_tab().chat_reading_position.is_none());
+        let fresh = render_to_text(&mut app, 48, 20);
+        assert!(fresh.contains("FRESH_"));
+        assert!(!fresh.contains("THINK_"));
+        app.current_tab_mut().scroll_to_bottom();
+        render_to_text(&mut app, 48, 20);
+        app.current_tab_mut().chat_scroll.by(30);
+        let fresh = render_to_text(&mut app, 48, 20);
+        assert_ne!(
+            app.current_tab()
+                .chat_reading_position
+                .unwrap()
+                .thought_source
+                .unwrap()
+                .0,
+            source.0
+        );
+        assert_eq!(render_to_text(&mut app, 48, 20), fresh);
+    }
+}
+
+#[test]
+fn chat_reading_position_removed_thought_clamps_to_survivor() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    for label in ["OLD", "FRESH"] {
+        app.current_tab_mut().messages.push(ChatMessage::Thought {
+            id: Default::default(),
+            text: (0..90)
+                .map(|i| format!("{label}_{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            expanded: true,
+            duration_ms: None,
+        });
+    }
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(110);
+    assert!(render_to_text(&mut app, 48, 20).contains("OLD_"));
+    let old_id = app
+        .current_tab()
+        .chat_reading_position
+        .unwrap()
+        .thought_source
+        .unwrap()
+        .0;
+    app.current_tab_mut().retain_current_messages(
+        |message| !matches!(message, ChatMessage::Thought { id, .. } if *id == old_id),
+    );
+    assert!(app
+        .current_tab()
+        .chat_reading_position
+        .unwrap()
+        .thought_source
+        .is_none());
+    let after = render_to_text(&mut app, 48, 20);
+    assert!(
+        after.lines().nth(1).unwrap().contains("FRESH_000"),
+        "{after}"
+    );
+    assert!(!after.contains("OLD_"));
+    assert_eq!(render_to_text(&mut app, 48, 20), after);
+    app.current_tab_mut().chat_scroll.by(-1);
+    let body = render_to_text(&mut app, 48, 20);
+    assert!(body.lines().next().unwrap().contains("FRESH_000"), "{body}");
+    assert_ne!(
+        app.current_tab()
+            .chat_reading_position
+            .unwrap()
+            .thought_source
+            .unwrap()
+            .0,
+        old_id
+    );
+    assert_eq!(render_to_text(&mut app, 48, 20), body);
+}
+
+#[test]
+fn chat_reading_position_stale_clear_does_not_rebind_new_messages() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_autofix_prompt(&mut app, "pane-1");
+    app.turn_observe_chunk(
+        DEFAULT_TAB_ID,
+        ChunkKind::Thought,
+        &(0..90)
+            .map(|i| format!("OLD_{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(30);
+    assert!(render_to_text(&mut app, 48, 20).contains("OLD_"));
+    assert!(app
+        .current_tab()
+        .chat_reading_position
+        .unwrap()
+        .thought_source
+        .is_some());
+    let offset = app.current_tab().chat_scroll.offset;
+    app.current_tab_mut()
+        .messages
+        .push(search_tool_message("old-tool", "Completed", "OLD_QUERY"));
+    app.current_tab_mut().active_tool_viewport_anchor = Some(("old-tool".into(), 3));
+    app.current_tab_mut().autofix.generation += 1;
+    app.turn_close(DEFAULT_TAB_ID);
+    let fresh = ChatMessage::System(
+        (0..130)
+            .map(|i| format!("FRESH_{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    app.current_tab_mut().messages.push(fresh.clone());
+    assert!(app.current_tab().chat_reading_position.is_none());
+    assert!(app.current_tab().active_tool_viewport_anchor.is_none());
+    let mut reference = test_app();
+    reference.state = ConnectionState::Connected;
+    reference.current_tab_mut().messages.push(fresh);
+    render_to_text(&mut reference, 48, 20);
+    reference.current_tab_mut().chat_scroll.by(offset as isize);
+    let expected = reading_rows(&render_to_text(&mut reference, 48, 20), "FRESH_");
+    for _ in 0..3 {
+        assert_eq!(
+            reading_rows(&render_to_text(&mut app, 48, 20), "FRESH_"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn chat_reading_position_completed_history_survives_active_cleanup() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    for stale in [false, true] {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        submit_autofix_prompt(&mut app, "pane-1");
+        app.current_tab_mut().completed_turns.push(CompletedTurn {
+            prompt: "history".into(),
+            details: vec![ChatMessage::System(
+                (0..90)
+                    .map(|i| format!("HISTORY_{i:03}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )],
+            expanded: true,
+            trailing_marker: None,
+        });
+        app.current_tab_mut()
+            .messages
+            .push(ChatMessage::Error("obsolete".into()));
+        render_to_text(&mut app, 48, 20);
+        app.current_tab_mut().chat_scroll.by(30);
+        let before = reading_rows(&render_to_text(&mut app, 48, 20), "HISTORY_");
+        if stale {
+            app.current_tab_mut().autofix.generation += 1;
+            app.turn_close(DEFAULT_TAB_ID);
+        } else {
+            reading_cleanup_errors(&mut app, "recovery");
+        }
+        assert_eq!(
+            app.current_tab().chat_reading_position.unwrap().turn_index,
+            0
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                reading_rows(&render_to_text(&mut app, 48, 20), "HISTORY_"),
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn chat_reading_position_background_cancel_preserves_viewport() {
+    let _locale = crate::test_support::lock_locale();
+    for cleanup in ["pane-closed", "transport-retired", "request"] {
+        for offset in [0, 30, 120] {
+            let mut app = test_app();
+            app.state = ConnectionState::Connected;
+            submit_autofix_prompt(&mut app, "pane-1");
+            let lines = |prefix| {
+                (0..90)
+                    .map(|i| format!("{prefix}_{i:03}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            app.current_tab_mut().completed_turns.push(CompletedTurn {
+                prompt: "history".into(),
+                details: vec![ChatMessage::System(lines("HISTORY"))],
+                expanded: true,
+                trailing_marker: None,
+            });
+            app.current_tab_mut()
+                .messages
+                .push(ChatMessage::System(lines("KEEP")));
+            render_to_text(&mut app, 48, 20);
+            app.current_tab_mut().chat_scroll.by(offset);
+            let prefix = if offset > 90 { "HISTORY_" } else { "KEEP_" };
+            let before = reading_rows(&render_to_text(&mut app, 48, 20), prefix);
+            assert!(!before.is_empty());
+            match cleanup {
+                "pane-closed" => app.handle_autofix_pane_closed(Some(DEFAULT_TAB_ID), "pane-1"),
+                "transport-retired" => app.settle_retired_transport_prompts(),
+                "request" => app.request_turn_cancel_for_tab(DEFAULT_TAB_ID),
+                _ => unreachable!(),
+            }
+            assert_eq!(app.current_tab().completed_turns.len(), 2);
+            for _ in 0..3 {
+                let after = render_to_text(&mut app, 48, 20);
+                if offset == 0 {
+                    assert_eq!(app.current_tab().chat_scroll.offset, 0);
+                } else {
+                    assert_eq!(reading_rows(&after, prefix), before, "{cleanup}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn chat_reading_position_foreground_cancel_keeps_bottom_reset() {
+    let _locale = crate::test_support::lock_locale();
+    for action in ["control-c", "stop", "escape"] {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        submit_autofix_prompt(&mut app, "pane-1");
+        app.current_tab_mut().messages.push(ChatMessage::System(
+            (0..90)
+                .map(|i| format!("KEEP_{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        render_to_text(&mut app, 48, 20);
+        app.current_tab_mut().chat_scroll.by(30);
+        render_to_text(&mut app, 48, 20);
+        assert!(app.current_tab().chat_reading_position.is_some());
+        match action {
+            "control-c" => {
+                app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            }
+            "stop" => app.cmd_stop(true, false),
+            "escape" => app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            _ => unreachable!(),
+        }
+        assert!(
+            app.current_tab().chat_reading_position.is_none(),
+            "{action}"
+        );
+        assert_eq!(app.current_tab().chat_scroll.offset, 0, "{action}");
+        render_to_text(&mut app, 48, 20);
+        assert_eq!(app.current_tab().chat_scroll.offset, 0, "{action}");
+    }
+}
+
+#[test]
+fn chat_reading_position_completed_marker_geometry_and_click() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    for first in ["界".repeat(22), "short".into()] {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        app.current_tab_mut().completed_turns.push(CompletedTurn {
+            prompt: "history".into(),
+            details: vec![
+                ChatMessage::System(first),
+                ChatMessage::System("LATER_MESSAGE".into()),
+                search_tool_message("later", "Completed", "LATER_QUERY"),
+            ],
+            expanded: true,
+            trailing_marker: Some("MARKER".into()),
+        });
+        let text = render_to_text(&mut app, 48, 24);
+        let tool_row = text
+            .lines()
+            .position(|line| line.contains("Search"))
+            .unwrap();
+        let hit = *app
+            .completed_turn_hits
+            .iter()
+            .find(|hit| hit.kind == (CompletedTurnHitKind::ToolCall { detail_index: 2 }))
+            .expect("later tool must have a click target");
+        assert_eq!(usize::from(hit.row), tool_row, "{text}");
+        click_tool_hit(&mut app, hit);
+        let expanded = render_to_text(&mut app, 48, 24);
+        assert!(expanded.contains("LATER_QUERY"), "{expanded}");
+        assert!(app.current_tab().completed_tool_call_expanded("later"));
+        assert_eq!(render_to_text(&mut app, 48, 24), expanded);
+    }
+}
+
+#[test]
+fn chat_reading_position_completed_marker_preserves_later_message() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    app.current_tab_mut().completed_turns.push(CompletedTurn {
+        prompt: "history".into(),
+        details: vec![
+            ChatMessage::System("界".repeat(22)),
+            ChatMessage::System(
+                (0..90)
+                    .map(|i| format!("LATER_{i:03}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            search_tool_message("later", "Completed", "LATER_QUERY"),
+        ],
+        expanded: true,
+        trailing_marker: Some("MARKER".into()),
+    });
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(30);
+    let before = reading_rows(&render_to_text(&mut app, 48, 20), "LATER_");
+    for width in [48, 80, 48, 80] {
+        assert_eq!(
+            reading_rows(&render_to_text(&mut app, width, 20), "LATER_"),
+            before
+        );
+    }
+}
+
+#[test]
+fn chat_reading_position_completed_marker_preserves_thought_source() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    app.current_tab_mut().completed_turns.push(CompletedTurn {
+        prompt: "history".into(),
+        details: vec![ChatMessage::Thought {
+            id: Default::default(),
+            text: (0..90)
+                .map(|i| format!("THINK_{i:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            expanded: true,
+            duration_ms: Some(12345),
+        }],
+        expanded: true,
+        trailing_marker: Some("(canceled)".into()),
+    });
+    render_to_text(&mut app, 26, 20);
+    app.current_tab_mut().chat_scroll.by(30);
+    let before = reading_rows(&render_to_text(&mut app, 26, 20), "THINK_");
+    assert!(!before.is_empty());
+    for width in [26, 50, 26, 50] {
+        assert_eq!(
+            reading_rows(&render_to_text(&mut app, width, 20), "THINK_"),
+            before
+        );
+    }
+}
+
+#[test]
+fn chat_reading_position_preserves_retained_streaming_thought_lines() {
+    let _locale = crate::test_support::lock_locale();
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "thinking");
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (0..500)
+            .map(|index| format!("THINK_{index:03}\n"))
+            .collect(),
+    });
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(130);
+    let before = reading_rows(&render_to_text(&mut app, 48, 20), "THINK_");
+    for start in [500, 510, 520] {
+        app.handle_event(AppEvent::AgentThoughtChunk {
+            session_id: DEFAULT_TAB_ID.into(),
+            text: (start..start + 10)
+                .map(|index| format!("THINK_{index:03}\n"))
+                .collect(),
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                reading_rows(&render_to_text(&mut app, 48, 20), "THINK_"),
+                before,
+            );
+        }
+    }
+    for start in [530, 540] {
+        app.handle_event(AppEvent::AgentThoughtChunk {
+            session_id: DEFAULT_TAB_ID.into(),
+            text: (start..start + 10)
+                .map(|index| format!("THINK_{index:03}\n"))
+                .collect(),
+        });
+    }
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "THINK_"),
+        before
+    );
+}
+
+#[test]
+fn chat_reading_position_near_width_thought_does_not_drift() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "thinking");
+    let word = "a".repeat(45);
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (0..70).map(|_| format!("a {word}\n")).collect(),
+    });
+    render_to_text(&mut app, 50, 20);
+    app.current_tab_mut().chat_scroll.by(30);
+    let mut before = String::new();
+    for _ in 0..4 {
+        app.current_tab_mut().chat_scroll.by(1);
+        before = render_to_text(&mut app, 50, 20);
+        if before.lines().next().unwrap().contains(&word) {
+            break;
+        }
+    }
+    assert!(before.lines().next().unwrap().contains(&word), "{before}");
+    for _ in 0..3 {
+        assert_eq!(render_to_text(&mut app, 50, 20), before);
+    }
+    let (id, mut byte) = app
+        .current_tab()
+        .chat_reading_position
+        .unwrap()
+        .thought_source
+        .unwrap();
+    for chunk in [["", "tail", ""].join("\n"), "界\n".repeat(400)] {
+        let current = app.current_tab().streaming_thought_text().unwrap();
+        let dropped_chars = (current.chars().count() + chunk.chars().count()).saturating_sub(4000);
+        let dropped_bytes = current.char_indices().nth(dropped_chars).unwrap().0;
+        byte -= dropped_bytes;
+        app.handle_event(AppEvent::AgentThoughtChunk {
+            session_id: DEFAULT_TAB_ID.into(),
+            text: chunk,
+        });
+        for width in [50, 52, 50, 52, 50] {
+            for _ in 0..2 {
+                let rendered = render_to_text(&mut app, width, 20);
+                assert!(
+                    rendered.lines().next().unwrap().contains(&word),
+                    "{rendered}"
+                );
+                assert_eq!(
+                    app.current_tab()
+                        .chat_reading_position
+                        .unwrap()
+                        .thought_source,
+                    Some((id, byte)),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn chat_reading_position_thought_retention_preserves_duplicate_and_blank_rows() {
+    let _locale = crate::test_support::lock_locale();
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "thinking");
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (0..300)
+            .map(|index| ["SAME", "", &format!("THINK_{index:03}"), ""].join("\r\n"))
+            .collect(),
+    });
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(130);
+    let before = render_to_text(&mut app, 48, 20);
+    let before_rows = reading_rows(&before, "│");
+    let mut split_crlf = false;
+    for _ in 0..30 {
+        app.handle_event(AppEvent::AgentThoughtChunk {
+            session_id: DEFAULT_TAB_ID.into(),
+            text: "界".into(),
+        });
+        split_crlf |= app
+            .current_tab()
+            .streaming_thought_text()
+            .unwrap()
+            .starts_with('\n');
+        let rendered = render_to_text(&mut app, 48, 20);
+        assert_eq!(reading_rows(&rendered, "│"), before_rows);
+    }
+    assert!(
+        split_crlf,
+        "exercise a CRLF split by the retention boundary"
+    );
+}
+
+#[test]
+fn chat_reading_position_preserves_soft_wrapped_thought_source() {
+    let _locale = crate::test_support::lock_locale();
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "thinking");
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (0..500)
+            .map(|index| format!("word{index:03} 界e\u{301} alpha-beta "))
+            .collect(),
+    });
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(49);
+    let before = render_to_text(&mut app, 48, 20);
+    let (id, mut byte) = app
+        .current_tab()
+        .chat_reading_position
+        .unwrap()
+        .thought_source
+        .unwrap();
+    let retained = app.current_tab().streaming_thought_text().unwrap();
+    let anchor_word = retained[byte..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(anchor_word.starts_with("word"), "{anchor_word}");
+    assert!(
+        before.lines().next().unwrap().contains(&anchor_word),
+        "{before}"
+    );
+    assert!(retained.len() > retained.chars().count());
+    // Each update crops a partial paragraph, sometimes inside a word or a
+    // combining sequence. The original source, not the new row start, survives.
+    for chunk in [
+        "界e\u{301} ",
+        "alpha-beta ",
+        "x",
+        "yz",
+        "more words 界 ",
+        "tail ",
+    ] {
+        let current = app.current_tab().streaming_thought_text().unwrap();
+        let cut_at = current.char_indices().nth(chunk.chars().count()).unwrap().0;
+        byte -= cut_at;
+        app.handle_event(AppEvent::AgentThoughtChunk {
+            session_id: DEFAULT_TAB_ID.into(),
+            text: chunk.into(),
+        });
+        for _ in 0..3 {
+            let rendered = render_to_text(&mut app, 48, 20);
+            assert!(
+                rendered.lines().next().unwrap().contains(&anchor_word),
+                "{rendered}"
+            );
+            assert_eq!(
+                app.current_tab()
+                    .chat_reading_position
+                    .unwrap()
+                    .thought_source,
+                Some((id, byte)),
+            );
+        }
+    }
+}
+
+#[test]
+fn chat_reading_position_thought_retention_clamps_deleted_source_and_follows_bottom() {
+    let _locale = crate::test_support::lock_locale();
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "thinking");
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (0..500)
+            .map(|index| format!("THINK_{index:03}\n"))
+            .collect(),
+    });
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(130);
+    render_to_text(&mut app, 48, 20);
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (500..900)
+            .map(|index| format!("THINK_{index:03}\n"))
+            .collect(),
+    });
+    let clamped = render_to_text(&mut app, 48, 20);
+    assert!(
+        clamped.lines().next().unwrap().contains("THINK_500"),
+        "{clamped}"
+    );
+    assert_eq!(render_to_text(&mut app, 48, 20), clamped);
+    assert_eq!(
+        app.current_tab()
+            .chat_reading_position
+            .unwrap()
+            .thought_source
+            .unwrap()
+            .1,
+        0,
+    );
+    app.current_tab_mut().scroll_to_bottom();
+    render_to_text(&mut app, 48, 20);
+    for start in [900, 910] {
+        app.handle_event(AppEvent::AgentThoughtChunk {
+            session_id: DEFAULT_TAB_ID.into(),
+            text: (start..start + 10)
+                .map(|index| format!("THINK_{index:03}\n"))
+                .collect(),
+        });
+        let bottom = render_to_text(&mut app, 48, 20);
+        assert!(
+            bottom.contains(&format!("THINK_{:03}", start + 9)),
+            "{bottom}"
+        );
+        assert_eq!(app.current_tab().chat_scroll.offset, 0);
+    }
+}
+
+#[test]
+fn chat_reading_position_thought_source_tracks_message_moves_and_capture() {
+    let _locale = crate::test_support::lock_locale();
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "thinking");
+    app.current_tab_mut()
+        .messages
+        .push(search_tool_message("removed", "Completed", "query"));
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (0..500)
+            .map(|index| format!("THINK_{index:03}\n"))
+            .collect(),
+    });
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(130);
+    let before = reading_rows(&render_to_text(&mut app, 48, 20), "THINK_");
+    app.handle_event(AppEvent::HideToolCall {
+        session_id: DEFAULT_TAB_ID.into(),
+        id: "removed".into(),
+    });
+    app.switch_tab_session("other".into());
+    app.switch_tab_session(DEFAULT_TAB_ID.into());
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (500..510)
+            .map(|index| format!("THINK_{index:03}\n"))
+            .collect(),
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "THINK_"),
+        before
+    );
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    let collapsed = render_to_text(&mut app, 48, 20);
+    assert!(!collapsed.contains("THINK_"));
+    assert!(app
+        .current_tab()
+        .chat_reading_position
+        .unwrap()
+        .thought_source
+        .is_none());
+    assert_eq!(render_to_text(&mut app, 48, 20), collapsed);
+}
+
+#[test]
+fn chat_reading_position_survives_reveal_notices_and_turn_completion() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = reading_test_app();
+    let before = reading_rows(&render_to_text(&mut app, 48, 20), "READ_");
+    let shown = app
+        .current_tab()
+        .streaming_agent_text()
+        .unwrap()
+        .chars()
+        .count();
+    app.current_tab_mut().reveal_chars = shown;
+    app.handle_event(AppEvent::AgentMessageChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: "NEW_OUTPUT\n".repeat(25),
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+    for reveal_chars in [shown + 40, shown + 140, usize::MAX] {
+        app.current_tab_mut().reveal_chars = reveal_chars;
+        assert_eq!(
+            reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+            before
+        );
+    }
+    app.handle_event(AppEvent::Plan {
+        session_id: DEFAULT_TAB_ID.into(),
+        entries: vec![PlanEntry {
+            content: "A new plan entry".into(),
+            status: PlanEntryStatus::InProgress,
+        }],
+    });
+    app.handle_event(AppEvent::TabSystemMessage {
+        tab_id: DEFAULT_TAB_ID.into(),
+        message: "passive notice".into(),
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: "new thought\n".repeat(20),
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    assert_eq!(app.current_tab().completed_turns.len(), 1);
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+}
+
+#[test]
+fn chat_reading_position_keeps_expanded_live_search_through_updates_and_capture() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "search");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "");
+    let query = (0..150)
+        .map(|index| format!("QUERY_{index:03} "))
+        .collect::<String>();
+    app.current_tab_mut().messages.extend([
+        search_tool_message("hidden", "Completed", "HIDDEN"),
+        search_tool_message("reading", "InProgress", &query),
+    ]);
+    render_to_text(&mut app, 48, 20);
+    let hit = *app
+        .completed_turn_hits
+        .iter()
+        .find(|hit| {
+            matches!(
+                hit.kind,
+                CompletedTurnHitKind::ActiveToolCall { detail_index: 2 }
+            )
+        })
+        .unwrap();
+    click_tool_hit(&mut app, hit);
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(-8);
+    let before = reading_rows(&render_to_text(&mut app, 48, 20), "QUERY_");
+    assert!(app.current_tab().chat_reading_position.unwrap().row_offset > 0);
+
+    app.handle_event(AppEvent::HideToolCall {
+        session_id: DEFAULT_TAB_ID.into(),
+        id: "hidden".into(),
+    });
+    app.handle_event(AppEvent::ToolCallUpdate {
+        session_id: DEFAULT_TAB_ID.into(),
+        id: "reading".into(),
+        title: None,
+        status: Some("Completed".into()),
+        kind: None,
+        query: None,
+        location: None,
+        location_is_command: false,
+        output: Some(ToolCallOutput {
+            text: "additional result\n".repeat(12),
+            truncated: false,
+        }),
+        content: None,
+        locations: None,
+        cwd: None,
+        exit_code: None,
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "QUERY_"),
+        before
+    );
+    app.handle_event(AppEvent::ToolCall {
+        session_id: DEFAULT_TAB_ID.into(),
+        id: "later".into(),
+        title: "Later tool".into(),
+        status: "InProgress".into(),
+        kind: ToolCallKind::Search,
+        query: None,
+        location: None,
+        location_is_command: false,
+        cwd: None,
+        output: None,
+        exit_code: None,
+        content: Vec::new(),
+        locations: Vec::new(),
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "QUERY_"),
+        before
+    );
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "QUERY_"),
+        before
+    );
+    assert!(app.current_tab().completed_tool_call_expanded("reading"));
+    assert_eq!(
+        app.current_tab()
+            .chat_reading_position
+            .unwrap()
+            .message_index,
+        Some(0)
+    );
+}
+
+#[test]
+fn chat_reading_position_preserves_viewport_height_changes_and_text_selection() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = reading_test_app();
+    let before = reading_rows(&render_to_text(&mut app, 48, 20), "READ_");
+    let row = before[1].0 as u16;
+    for (kind, column) in [
+        (MouseEventKind::Down(MouseButton::Left), 2),
+        (MouseEventKind::Drag(MouseButton::Left), 9),
+        (MouseEventKind::Up(MouseButton::Left), 9),
+    ] {
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+    let selected = app.text_selection.selected_text().expect("selected text");
+    app.handle_event(AppEvent::AgentMessageChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: "later output\n".repeat(20),
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+    assert_eq!(app.text_selection.selected_text(), Some(selected));
+    app.text_selection.clear();
+
+    app.current_tab_mut().input = ["a draft", "with several", "input rows"].join("\n");
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 24), "READ_"),
+        before
+    );
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 40, 24), "READ_"),
+        before
+    );
+    app.current_tab_mut().input.clear();
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+    let (responder, _response) = tokio::sync::oneshot::channel();
+    app.handle_event(AppEvent::PermissionRequest {
+        session_id: DEFAULT_TAB_ID.into(),
+        tool_call_id: "permission".into(),
+        description: "Allow this tool?".into(),
+        title: "Allow this tool?".into(),
+        kind_label: None,
+        target: None,
+        target_is_command: false,
+        options: vec![PermOption {
+            id: "allow-once".into(),
+            name: "Allow".into(),
+            kind: "AllowOnce".into(),
+        }],
+        responder,
+    });
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+    app.current_tab_mut().permission.pop_front();
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+}
+
+#[test]
+fn chat_reading_position_resumes_follow_and_explicit_resets() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = reading_test_app();
+    app.current_tab_mut().chat_scroll.by(-isize::MAX);
+    render_to_text(&mut app, 48, 20);
+    assert_eq!(app.current_tab().chat_scroll.offset, 0);
+    app.handle_event(AppEvent::AgentMessageChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: "FOLLOW_BOTTOM".into(),
+    });
+    assert!(render_to_text(&mut app, 48, 20).contains("FOLLOW_BOTTOM"));
+    assert_eq!(app.current_tab().chat_scroll.offset, 0);
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    assert!(render_to_text(&mut app, 48, 20).contains("FOLLOW_BOTTOM"));
+    assert_eq!(app.current_tab().chat_scroll.offset, 0);
+    app.current_tab_mut().chat_scroll.by(20);
+    render_to_text(&mut app, 48, 20);
+    submit_test_prompt(&mut app, "NEW_PROMPT");
+    assert!(render_to_text(&mut app, 48, 20).contains("NEW_PROMPT"));
+    assert_eq!(app.current_tab().chat_scroll.offset, 0);
+    app.current_tab_mut().chat_scroll.by(20);
+    render_to_text(&mut app, 48, 20);
+    app.cmd_clear();
+    assert!(app.current_tab().chat_reading_position.is_none());
+    assert!(!render_to_text(&mut app, 48, 20).contains("READ_"));
+
+    let mut app = reading_test_app();
+    let (load_session_tx, mut load_session_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.load_session_tx = load_session_tx;
+    app.handle_event(AppEvent::WtEvent {
+        method: "load_session".into(),
+        pane_id: String::new(),
+        tab_id: None,
+        params: json!({
+            "tab_id": DEFAULT_TAB_ID,
+            "session_id": "loaded-session",
+        }),
+    });
+    assert_eq!(
+        load_session_rx.try_recv().unwrap().session_id,
+        "loaded-session"
+    );
+    assert_eq!(app.current_tab().chat_scroll.offset, 0);
+    assert!(app.current_tab().chat_reading_position.is_none());
+    assert!(!render_to_text(&mut app, 48, 20).contains("READ_"));
+}
+
+#[test]
+fn chat_reading_position_is_tab_local_and_keeps_history_navigation_lazy() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = reading_test_app();
+    let before = reading_rows(&render_to_text(&mut app, 48, 20), "READ_");
+    let offset = app.current_tab().chat_scroll.offset;
+    app.tab_id = Some("other".into());
+    app.current_tab_mut().session_id = Some("other-session".into());
+    submit_test_prompt(&mut app, "other prompt");
+    app.handle_event(AppEvent::AgentMessageChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: "background output\n".repeat(20),
+    });
+    render_to_text(&mut app, 48, 20);
+    assert_eq!(app.current_tab().chat_scroll.offset, 0);
+    app.tab_id = None;
+    assert_eq!(app.current_tab().chat_scroll.offset, offset);
+    assert_eq!(
+        reading_rows(&render_to_text(&mut app, 48, 20), "READ_"),
+        before
+    );
+
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    for index in 0..200 {
+        app.current_tab_mut().completed_turns.push(CompletedTurn {
+            prompt: format!("HISTORY_{index:03}"),
+            details: vec![ChatMessage::Agent("detail".into())],
+            expanded: true,
+            trailing_marker: None,
+        });
+    }
+    app.current_tab_mut().select_completed_turn(100);
+    let selected = render_to_text(&mut app, 48, 20);
+    assert!(selected.contains("HISTORY_099"));
+    crate::ui::chat::reset_completed_turn_line_build_count();
+    app.handle_event(AppEvent::TabSystemMessage {
+        tab_id: DEFAULT_TAB_ID.into(),
+        message: "passive notification\n".repeat(20),
+    });
+    let updated = render_to_text(&mut app, 48, 20);
+    assert_eq!(
+        reading_rows(&updated, "HISTORY_"),
+        reading_rows(&selected, "HISTORY_")
+    );
+    assert_eq!(app.current_tab().selected_completed_turn_idx, Some(100));
+    assert!(crate::ui::chat::completed_turn_line_build_count() < 20);
+}
+
+#[test]
+fn chat_reading_position_clamps_collapsed_and_removed_content() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = reading_test_app();
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: (0..70)
+            .map(|index| format!("THOUGHT_{index:03}\n"))
+            .collect(),
+    });
+    app.current_tab_mut().scroll_to_bottom();
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(15);
+    let thought = render_to_text(&mut app, 48, 20);
+    assert!(thought.contains("THOUGHT_"));
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    let collapsed = render_to_text(&mut app, 48, 20);
+    assert!(!collapsed.contains("THOUGHT_"));
+    assert!(collapsed.contains("Think"));
+    assert!(app.current_tab().chat_scroll.offset <= app.current_tab().chat_scroll.max);
+    assert_eq!(render_to_text(&mut app, 48, 20), collapsed);
+
+    let mut app = reading_test_app();
+    app.current_tab_mut().messages.push(search_tool_message(
+        "removed",
+        "InProgress",
+        &"QUERY_WORD ".repeat(140),
+    ));
+    app.current_tab_mut()
+        .expanded_completed_tool_calls
+        .insert("removed".into());
+    app.current_tab_mut().scroll_to_bottom();
+    render_to_text(&mut app, 48, 20);
+    app.current_tab_mut().chat_scroll.by(15);
+    assert!(render_to_text(&mut app, 48, 20).contains("QUERY_WORD"));
+    app.handle_event(AppEvent::HideToolCall {
+        session_id: DEFAULT_TAB_ID.into(),
+        id: "removed".into(),
+    });
+    let surviving = render_to_text(&mut app, 48, 20);
+    assert!(!surviving.contains("QUERY_WORD"));
+    assert!(surviving.contains("READ_"));
+    assert_eq!(render_to_text(&mut app, 48, 20), surviving);
+}
+
 #[test]
 fn active_tool_geometry_does_not_create_completed_turn_controls() {
     let mut app = test_app();
