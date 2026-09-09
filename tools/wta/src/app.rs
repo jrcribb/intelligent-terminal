@@ -4836,6 +4836,11 @@ impl App {
 pub(crate) enum CompletedTurnHitKind {
     Triangle,
     UserInput,
+    Thought {
+        id: tab_state::ThoughtId,
+        detail_index: usize,
+        active: bool,
+    },
     ToolCall {
         detail_index: usize,
     },

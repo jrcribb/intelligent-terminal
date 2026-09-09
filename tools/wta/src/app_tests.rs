@@ -14265,19 +14265,21 @@ fn first_message_chunk_transitions_to_streaming_with_transcript_text() {
     assert!(app.current_tab().turn.is_streaming());
     assert!(
         !app.current_tab().should_show_thinking(),
-        "visible response text replaces the generic Thinking row with inline activity"
+        "visible response text replaces the generic Thinking row"
     );
     app.current_tab_mut().reveal_chars = "partial".chars().count();
-    assert!(render_to_text(&mut app, 80, 20).contains("Think · …"));
+    let rendered = render_to_text(&mut app, 80, 20);
+    assert!(rendered.contains("partial"));
+    assert!(!rendered.contains("Think · …"));
     app.advance_reveal();
     assert!(
         !app.current_tab().should_show_thinking(),
-        "inline activity remains visible beside revealed response text"
+        "revealed response text does not need synthetic thinking content"
     );
 }
 
 #[test]
-fn latest_thought_remains_visible_alongside_streaming_message_until_turn_end() {
+fn thought_phases_collapse_and_remain_in_order_after_answers_and_turn_end() {
     let _locale = crate::test_support::lock_locale();
     rust_i18n::set_locale("en-US");
     let mut app = test_app();
@@ -14289,7 +14291,7 @@ fn latest_thought_remains_visible_alongside_streaming_message_until_turn_end() {
     assert_eq!(tab.streaming_agent_text(), None);
     assert_eq!(tab.streaming_thought_text(), Some("thinking…"));
     assert!(!tab.should_show_thinking());
-    assert!(render_to_text(&mut app, 80, 20).contains("Think · t"));
+    assert!(render_to_text(&mut app, 80, 20).contains("│ thinking…"));
 
     app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Message, "Final answer");
     let tab = app.current_tab();
@@ -14310,13 +14312,483 @@ fn latest_thought_remains_visible_alongside_streaming_message_until_turn_end() {
     let rendered = render_to_text(&mut app, 80, 20);
     assert!(rendered.contains("Final"));
     assert!(!rendered.contains("thinking"));
-    assert!(rendered.contains("Think · late visible thought"));
+    assert!(rendered.contains("│ late visible thought"));
 
     app.handle_event(AppEvent::AgentMessageEnd {
         session_id: DEFAULT_TAB_ID.into(),
     });
     assert_eq!(app.current_tab().streaming_thought_text(), None);
-    assert!(!render_to_text(&mut app, 80, 20).contains("Think ·"));
+    let rendered = render_to_text(&mut app, 80, 20);
+    assert!(!rendered.contains("late visible thought"));
+    let details = &app.current_tab().completed_turns[0].details;
+    assert!(
+        matches!(&details[0], ChatMessage::Thought { text, expanded: false, duration_ms: Some(_), .. } if text == "thinking…")
+    );
+    assert!(matches!(&details[1], ChatMessage::Agent(text) if text == "Final answer"));
+    assert!(
+        matches!(&details[2], ChatMessage::Thought { text, expanded: false, .. } if text == "late visible thought")
+    );
+    assert!(app.current_tab_mut().toggle_thought(0, 0, false));
+    let reopened = render_to_text(&mut app, 80, 20);
+    assert!(reopened.contains("│ thinking…"));
+    assert!(!reopened.contains("late visible thought"));
+}
+
+#[test]
+fn thought_mouse_headers_toggle_live_and_completed_without_body_hits() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "inspect");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "PRIVATE_REASONING_BODY");
+    let send = |app: &mut App, kind, hit: CompletedTurnHitRegion, column, row| {
+        assert!(hit.start_column < hit.end_column);
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    };
+    for active in [true, false] {
+        render_to_text(&mut app, 80, 24);
+        let hit = *app
+            .completed_turn_hits
+            .iter()
+            .find(|hit| {
+                matches!(hit.kind,
+                    CompletedTurnHitKind::Thought { active: hit_active, .. } if hit_active == active
+                )
+            })
+            .expect("visible thought header");
+        assert!(app
+            .completed_turn_action_links
+            .iter()
+            .any(|link| link.start_column == hit.start_column
+                && link.end_column == hit.end_column
+                && link.row == hit.row));
+        // The body and trailing whitespace are not action links.
+        assert!(!app
+            .completed_turn_hits
+            .iter()
+            .any(|region| region.contains(hit.start_column, hit.row + 1)));
+        send(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            hit,
+            hit.start_column,
+            hit.row,
+        );
+        send(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            hit,
+            hit.start_column + 1,
+            hit.row,
+        );
+        send(
+            &mut app,
+            MouseEventKind::Up(MouseButton::Left),
+            hit,
+            hit.start_column,
+            hit.row,
+        );
+        let expected_visible = active;
+        assert_eq!(
+            render_to_text(&mut app, 80, 24).contains("PRIVATE_REASONING_BODY"),
+            expected_visible
+        );
+        for visible in [!expected_visible, expected_visible] {
+            app.text_selection.clear();
+            let hit = *app.completed_turn_hits.iter().find(|hit| matches!(hit.kind,
+                CompletedTurnHitKind::Thought { active: hit_active, .. } if hit_active == active
+            )).unwrap();
+            send(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                hit,
+                hit.end_column - 1,
+                hit.row,
+            );
+            send(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                hit,
+                hit.end_column - 1,
+                hit.row,
+            );
+            assert_eq!(
+                render_to_text(&mut app, 80, 24).contains("PRIVATE_REASONING_BODY"),
+                visible
+            );
+        }
+        if active {
+            app.handle_event(AppEvent::AgentMessageEnd {
+                session_id: DEFAULT_TAB_ID.into(),
+            });
+        }
+    }
+}
+
+#[test]
+fn thought_mouse_release_tracks_identity_after_tool_removal() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "inspect");
+    app.handle_event(AppEvent::ToolCall {
+        session_id: DEFAULT_TAB_ID.into(),
+        id: "hidden-tool".into(),
+        title: "Preparing command".into(),
+        status: "InProgress".into(),
+        kind: ToolCallKind::Other,
+        location: None,
+        location_is_command: false,
+        cwd: None,
+        output: None,
+        exit_code: None,
+        content: Vec::new(),
+        locations: Vec::new(),
+    });
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "retained thought");
+    let find_header = |app: &mut App| {
+        render_to_text(app, 80, 24);
+        *app.completed_turn_hits
+            .iter()
+            .find(|hit| matches!(hit.kind, CompletedTurnHitKind::Thought { active: true, .. }))
+            .unwrap()
+    };
+    let mouse = |kind, hit: CompletedTurnHitRegion| {
+        AppEvent::Mouse(MouseEvent {
+            kind,
+            column: hit.start_column,
+            row: hit.row,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    let pressed = find_header(&mut app);
+    app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), pressed));
+    app.handle_event(AppEvent::HideToolCall {
+        session_id: DEFAULT_TAB_ID.into(),
+        id: "hidden-tool".into(),
+    });
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, " continued");
+    let released = find_header(&mut app);
+    let CompletedTurnHitKind::Thought {
+        id: pressed_id,
+        detail_index: old_index,
+        ..
+    } = pressed.kind
+    else {
+        panic!("thought header");
+    };
+    let CompletedTurnHitKind::Thought {
+        id, detail_index, ..
+    } = released.kind
+    else {
+        panic!("thought header");
+    };
+    assert_eq!(id, pressed_id);
+    assert_eq!(detail_index + 1, old_index);
+    app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), released));
+    assert!(matches!(&app.current_tab().messages[detail_index],
+        ChatMessage::Thought { text, expanded: false, .. } if text == "retained thought continued"));
+}
+
+#[test]
+fn thought_mouse_release_rejects_replacement_reordering_and_new_turn() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    for change in ["replacement", "reordering", "new turn", "stale geometry"] {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        submit_test_prompt(&mut app, "inspect");
+        app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "same text");
+        let find_header = |app: &mut App| {
+            render_to_text(app, 80, 24);
+            *app.completed_turn_hits
+                .iter()
+                .find(|hit| matches!(hit.kind, CompletedTurnHitKind::Thought { active: true, .. }))
+                .unwrap()
+        };
+        let mouse = |kind, hit: CompletedTurnHitRegion| {
+            AppEvent::Mouse(MouseEvent {
+                kind,
+                column: hit.start_column,
+                row: hit.row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let pressed = find_header(&mut app);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), pressed));
+        match change {
+            "new turn" => {
+                app.handle_event(AppEvent::AgentMessageEnd {
+                    session_id: DEFAULT_TAB_ID.into(),
+                });
+                submit_test_prompt(&mut app, "another turn");
+                app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "same text");
+            }
+            "reordering" => {
+                app.current_tab_mut().finish_thought();
+                app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "same text");
+                let tab = app.current_tab_mut();
+                let last = tab.messages.len() - 1;
+                tab.messages.swap(last - 1, last);
+            }
+            _ => {
+                app.current_tab_mut().finish_thought();
+                app.current_tab_mut().messages.pop();
+                app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "same text");
+            }
+        }
+        let released = if change == "reordering" {
+            render_to_text(&mut app, 80, 24);
+            *app.completed_turn_hits
+                .iter()
+                .find(|hit| {
+                    matches!((hit.kind, pressed.kind),
+                    (CompletedTurnHitKind::Thought { detail_index, active: true, .. },
+                     CompletedTurnHitKind::Thought { detail_index: old_index, .. })
+                        if detail_index == old_index)
+                })
+                .unwrap()
+        } else if change == "stale geometry" {
+            pressed
+        } else {
+            find_header(&mut app)
+        };
+        let before = app.current_tab().messages.clone();
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), released));
+        assert_eq!(app.current_tab().messages, before, "{change}");
+    }
+}
+
+#[test]
+fn thought_legacy_cache_assigns_unique_identity_and_preserves_state() {
+    let legacy = r#"{"Thought":{"text":"cached reasoning","expanded":true,"duration_ms":3000}}"#;
+    let first: ChatMessage = serde_json::from_str(legacy).unwrap();
+    let second: ChatMessage = serde_json::from_str(legacy).unwrap();
+    let ChatMessage::Thought {
+        id,
+        text,
+        expanded,
+        duration_ms,
+    } = &first
+    else {
+        panic!("cached thought");
+    };
+    assert_eq!(text, "cached reasoning");
+    assert!(*expanded);
+    assert_eq!(*duration_ms, Some(3000));
+    assert!(matches!(second, ChatMessage::Thought { id: other, .. } if *id != other));
+    let restored: ChatMessage =
+        serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+    assert_eq!(restored, first);
+}
+
+#[test]
+fn thought_keyboard_toggles_active_selected_and_latest_turn_only() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    for prompt in ["first", "second"] {
+        submit_test_prompt(&mut app, prompt);
+        app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, prompt);
+        app.handle_key(key);
+        assert!(matches!(
+            app.current_tab().messages.last(),
+            Some(ChatMessage::Thought {
+                expanded: false,
+                ..
+            })
+        ));
+        app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, " more");
+        assert!(matches!(
+            app.current_tab().messages.last(),
+            Some(ChatMessage::Thought {
+                expanded: false,
+                ..
+            })
+        ));
+        app.handle_event(AppEvent::AgentMessageEnd {
+            session_id: DEFAULT_TAB_ID.into(),
+        });
+    }
+    app.handle_key(key);
+    assert!(matches!(
+        app.current_tab().completed_turns[0].details[0],
+        ChatMessage::Thought {
+            expanded: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        app.current_tab().completed_turns[1].details[0],
+        ChatMessage::Thought { expanded: true, .. }
+    ));
+    app.current_tab_mut().select_completed_turn(0);
+    app.current_tab_mut().completed_turns[0].expanded = false;
+    app.handle_key(key);
+    assert!(app.current_tab().completed_turns[0].expanded);
+    assert!(matches!(
+        app.current_tab().completed_turns[0].details[0],
+        ChatMessage::Thought { expanded: true, .. }
+    ));
+    assert!(matches!(
+        app.current_tab().completed_turns[1].details[0],
+        ChatMessage::Thought { expanded: true, .. }
+    ));
+}
+
+#[test]
+fn thought_phase_duration_cancel_clear_and_unicode_retention() {
+    let mut app = test_app();
+    submit_test_prompt(&mut app, "inspect");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, &"😀思".repeat(2100));
+    app.current_tab_mut().streaming_thought =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "");
+    let message = app.current_tab().messages.last().unwrap();
+    let ChatMessage::Thought {
+        text,
+        duration_ms: Some(duration),
+        expanded,
+        ..
+    } = message
+    else {
+        panic!("finished thought")
+    };
+    assert_eq!(text.chars().count(), 4000);
+    assert!((3000..4000).contains(duration));
+    assert!(!expanded);
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "second phase");
+    app.turn_cancel(DEFAULT_TAB_ID);
+    let details = &app.current_tab().completed_turns[0].details;
+    assert_eq!(
+        details
+            .iter()
+            .filter(|message| matches!(
+                message,
+                ChatMessage::Thought {
+                    expanded: false,
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+    let saved = serde_json::to_string(&app.current_tab().completed_turns[0]).unwrap();
+    let restored: CompletedTurn = serde_json::from_str(&saved).unwrap();
+    assert_eq!(restored, app.current_tab().completed_turns[0]);
+    assert!(!app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "late ignored"));
+    app.current_tab_mut().clear_chat_history();
+    app.current_tab_mut().clear_completed_turns();
+    assert!(app.current_tab().messages.is_empty());
+    assert!(app.current_tab().streaming_thought_text().is_none());
+    assert!(app.current_tab().completed_turns.is_empty());
+}
+
+#[test]
+fn thought_replay_preserves_order_without_fabricated_duration() {
+    let mut app = test_app();
+    bind_test_session(&mut app, DEFAULT_TAB_ID);
+    app.current_tab_mut().loading_session = true;
+    app.current_tab_mut().loading_target_session_id = Some(DEFAULT_TAB_ID.into());
+    app.handle_event(AppEvent::UserMessageReplayChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        message_id: Some("one".into()),
+        text: "question".into(),
+    });
+    for text in ["replayed ", "thought"] {
+        app.handle_event(AppEvent::AgentThoughtChunk {
+            session_id: DEFAULT_TAB_ID.into(),
+            text: text.into(),
+        });
+    }
+    app.handle_event(AppEvent::AgentMessageChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: "answer".into(),
+    });
+    app.handle_event(AppEvent::AgentThoughtChunk {
+        session_id: DEFAULT_TAB_ID.into(),
+        text: "after answer".into(),
+    });
+    app.current_tab_mut().flush_load_replay_pending();
+    app.current_tab_mut().pack_replayed_messages_into_turns();
+    let details = &app.current_tab().completed_turns[0].details;
+    assert_eq!(details.len(), 3);
+    assert!(
+        matches!(&details[0], ChatMessage::Thought { text, expanded: false, duration_ms: None, .. } if text == "replayed thought")
+    );
+    assert!(matches!(&details[1], ChatMessage::Agent(text) if text == "answer"));
+    assert!(
+        matches!(&details[2], ChatMessage::Thought { text, expanded: false, duration_ms: None, .. } if text == "after answer")
+    );
+}
+
+#[test]
+fn thought_session_isolation_and_stale_mouse_release() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "first tab");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "first tab thought");
+    render_to_text(&mut app, 80, 24);
+    let hit = *app
+        .completed_turn_hits
+        .iter()
+        .find(|hit| matches!(hit.kind, CompletedTurnHitKind::Thought { active: true, .. }))
+        .unwrap();
+    let mouse = |kind| {
+        AppEvent::Mouse(MouseEvent {
+            kind,
+            column: hit.start_column,
+            row: hit.row,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left)));
+    app.switch_tab_session("second-tab".into());
+    bind_test_session(&mut app, "second-session");
+    submit_test_prompt(&mut app, "second tab");
+    app.turn_observe_chunk("second-session", ChunkKind::Thought, "second tab thought");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, " continued");
+    assert_eq!(
+        app.current_tab().streaming_thought_text(),
+        Some("second tab thought")
+    );
+    app.switch_tab_session(DEFAULT_TAB_ID.into());
+    render_to_text(&mut app, 80, 24);
+    app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left)));
+    assert_eq!(
+        app.current_tab().streaming_thought_text(),
+        Some("first tab thought continued")
+    );
+    assert!(matches!(
+        app.current_tab().messages.last(),
+        Some(ChatMessage::Thought { expanded: true, .. })
+    ));
+    app.text_selection.clear();
+    app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left)));
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    render_to_text(&mut app, 80, 24);
+    app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left)));
+    assert!(matches!(
+        app.current_tab().completed_turns[0].details[0],
+        ChatMessage::Thought {
+            expanded: false,
+            ..
+        }
+    ));
+    app.switch_tab_session("second-tab".into());
+    app.current_tab_mut().clear_chat_history();
+    assert!(!app.turn_observe_chunk("second-session", ChunkKind::Thought, "discard after clear"));
+    assert!(app.current_tab().messages.is_empty());
 }
 
 #[test]
@@ -14344,7 +14816,6 @@ fn whitespace_thought_keeps_only_generic_thinking_activity() {
 
     let tab = app.current_tab();
     assert!(tab.should_show_thinking());
-    assert!(!tab.should_show_inline_thinking());
     assert_eq!(crate::ui::chat::pending_render_text(tab), None);
 }
 
@@ -14419,9 +14890,13 @@ fn running_tool_replaces_thinking_until_tool_completes() {
         "the running tool card is already visible progress"
     );
     assert_eq!(app.current_tab().streaming_thought_text(), None);
+    assert_eq!(
+        crate::ui::chat::pending_render_text(app.current_tab()),
+        None
+    );
     assert!(
-        render_to_text(&mut app, 80, 20).contains("Think · …"),
-        "tool activity must retain inline Thinking until the turn ends"
+        !render_to_text(&mut app, 80, 20).contains("Think · …"),
+        "tool activity must not invent thinking content in the transcript"
     );
 
     app.handle_event(AppEvent::ToolCallUpdate {
