@@ -2628,6 +2628,7 @@ get time"#
         ChatMessage::User("list files".to_string()),
         ChatMessage::ToolCall {
             id: "t1".to_string(),
+            query: None,
             title: "ls".to_string(),
             status: "done".to_string(),
             kind: ToolCallKind::Other,
@@ -9890,6 +9891,7 @@ fn streamed_prose_and_tool_calls_preserve_acp_arrival_order() {
     app.current_tab_mut().reveal_chars = 12;
     app.handle_event(AppEvent::ToolCall {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool-1".into(),
         title: "apply_patch".into(),
         status: "InProgress".into(),
@@ -9930,6 +9932,7 @@ fn tool_only_turn_commits_the_ordered_tool_transcript() {
     submit_test_prompt(&mut app, "inspect");
     app.handle_event(AppEvent::ToolCall {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool-1".into(),
         title: "Find files".into(),
         status: "Completed".into(),
@@ -10293,6 +10296,7 @@ fn render_tool_call_card_in_chat() {
     app.state = ConnectionState::Connected;
     app.current_tab_mut().messages.push(ChatMessage::ToolCall {
         id: "mock-tool-1".into(),
+        query: None,
         title: "Run: echo TOOL_XYZ".into(),
         status: "Pending".into(),
         kind: ToolCallKind::Execute,
@@ -12923,6 +12927,7 @@ fn clicking_completed_tool_header_toggles_only_that_tool() {
         details: vec![
             ChatMessage::ToolCall {
                 id: "first-tool".into(),
+                query: None,
                 title: "Read first".into(),
                 status: "Completed".into(),
                 kind: ToolCallKind::Other,
@@ -12939,6 +12944,7 @@ fn clicking_completed_tool_header_toggles_only_that_tool() {
             },
             ChatMessage::ToolCall {
                 id: "second-tool".into(),
+                query: None,
                 title: "Read second".into(),
                 status: "Completed".into(),
                 kind: ToolCallKind::Other,
@@ -12998,6 +13004,7 @@ fn adjacent_successful_reads_render_as_one_compact_group() {
     .enumerate()
     .map(|(index, path)| ChatMessage::ToolCall {
         id: format!("read-{index}"),
+        query: None,
         title: format!("Viewing {path}"),
         status: "Completed".into(),
         kind: ToolCallKind::Read,
@@ -13029,6 +13036,7 @@ fn generic_read_group_lists_visible_targets_and_remaining_count() {
         .enumerate()
         .map(|(index, path)| ChatMessage::ToolCall {
             id: format!("read-{index}"),
+            query: None,
             title: "Read file".into(),
             status: "Completed".into(),
             kind: ToolCallKind::Read,
@@ -13058,6 +13066,7 @@ fn clicking_completed_read_group_expands_every_member() {
         .enumerate()
         .map(|(index, path)| ChatMessage::ToolCall {
             id: format!("read-{index}"),
+            query: None,
             title: format!("Viewing {path}"),
             status: "Completed".into(),
             kind: ToolCallKind::Read,
@@ -13123,6 +13132,7 @@ fn pending_tool_in_completed_turn_keeps_clickable_status_marker() {
         prompt: "Interrupted turn".into(),
         details: vec![ChatMessage::ToolCall {
             id: "pending-tool".into(),
+            query: None,
             title: "Pending operation".into(),
             status: "Pending".into(),
             kind: ToolCallKind::Other,
@@ -13481,6 +13491,7 @@ fn render_large_mixed_chat_keeps_latest_content_and_width_correct() {
                 ChatMessage::Agent(format!("old response {index}")),
                 ChatMessage::ToolCall {
                     id: format!("old-tool-{index}"),
+                    query: None,
                     title: "Read old file".into(),
                     status: "Completed".into(),
                     kind: ToolCallKind::Read,
@@ -13508,6 +13519,7 @@ fn render_large_mixed_chat_keeps_latest_content_and_width_correct() {
             ),
             ChatMessage::ToolCall {
                 id: "latest-read".into(),
+                query: None,
                 title: "Read latest file".into(),
                 status: "Completed".into(),
                 kind: ToolCallKind::Read,
@@ -13524,6 +13536,7 @@ fn render_large_mixed_chat_keeps_latest_content_and_width_correct() {
             },
             ChatMessage::ToolCall {
                 id: "latest-execute".into(),
+                query: None,
                 title: "Run latest tests".into(),
                 status: "Completed".into(),
                 kind: ToolCallKind::Execute,
@@ -13540,6 +13553,7 @@ fn render_large_mixed_chat_keeps_latest_content_and_width_correct() {
             },
             ChatMessage::ToolCall {
                 id: "latest-edit".into(),
+                query: None,
                 title: "Edit latest source".into(),
                 status: "Completed".into(),
                 kind: ToolCallKind::Edit,
@@ -14067,6 +14081,7 @@ fn completed_tool_output_update_invalidates_cached_turn_height() {
         prompt: "TERMINAL_CACHE_PROMPT".into(),
         details: vec![ChatMessage::ToolCall {
             id: "terminal-cache-tool".into(),
+            query: None,
             title: "Run cached command".into(),
             status: "Completed".into(),
             kind: ToolCallKind::Execute,
@@ -14540,6 +14555,7 @@ fn thought_mouse_release_tracks_identity_after_tool_removal() {
         title: "Preparing command".into(),
         status: "InProgress".into(),
         kind: ToolCallKind::Other,
+        query: None,
         location: None,
         location_is_command: false,
         cwd: None,
@@ -14969,6 +14985,7 @@ fn running_tool_replaces_thinking_until_tool_completes() {
     app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "Choosing files");
     app.handle_event(AppEvent::ToolCall {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool".into(),
         title: "Find files".into(),
         status: "InProgress".into(),
@@ -14997,6 +15014,7 @@ fn running_tool_replaces_thinking_until_tool_completes() {
 
     app.handle_event(AppEvent::ToolCallUpdate {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool".into(),
         title: None,
         status: Some("Completed".into()),
@@ -15015,6 +15033,539 @@ fn running_tool_replaces_thinking_until_tool_completes() {
     );
 }
 
+fn search_tool_message(id: &str, status: &str, query: &str) -> ChatMessage {
+    ChatMessage::ToolCall {
+        id: id.into(),
+        title: "Searching for 'As of September...'".into(),
+        status: status.into(),
+        kind: ToolCallKind::Search,
+        query: Some(ToolCallOutput {
+            text: query.into(),
+            truncated: false,
+        }),
+        location: None,
+        location_is_command: false,
+        cwd: None,
+        output: Some(ToolCallOutput {
+            text: format!("RESULT_{id}"),
+            truncated: false,
+        }),
+        exit_code: None,
+        content: Vec::new(),
+        locations: Vec::new(),
+    }
+}
+
+fn click_tool_hit(app: &mut App, hit: CompletedTurnHitRegion) {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    app.text_selection.clear();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind,
+            column: hit.end_column - 1,
+            row: hit.row,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+}
+
+#[test]
+fn active_search_and_thought_share_disclosure_geometry_and_keyboard_toggle() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "inspect");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "retained reasoning");
+    app.current_tab_mut().finish_thought();
+    app.current_tab_mut().messages.extend([
+        search_tool_message("one", "Completed", "FIRST_QUERY"),
+        search_tool_message("two", "Completed", "SECOND_QUERY"),
+    ]);
+    let compact = render_to_text(&mut app, 48, 40);
+    assert!(!compact.contains("retained reasoning"));
+    assert!(!compact.contains("FIRST_QUERY"));
+    assert_eq!(app.completed_turn_hits.len(), 2);
+    assert!(app
+        .completed_turn_hits
+        .iter()
+        .any(|hit| matches!(hit.kind, CompletedTurnHitKind::Thought { active: true, .. })));
+    assert!(app.completed_turn_hits.iter().any(|hit| matches!(
+        hit.kind,
+        CompletedTurnHitKind::ActiveToolGroup {
+            detail_count: 2,
+            ..
+        }
+    )));
+
+    for active in [true, false] {
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let expanded = render_to_text(&mut app, 48, 40);
+        for text in [
+            "retained reasoning",
+            "FIRST_QUERY",
+            "SECOND_QUERY",
+            "RESULT_one",
+        ] {
+            assert!(expanded.contains(text), "{expanded}");
+        }
+        assert!(!expanded.contains("Think · …"));
+        let headers = app
+            .completed_turn_hits
+            .iter()
+            .filter(|hit| {
+                matches!(
+                    hit.kind,
+                    CompletedTurnHitKind::Thought { .. }
+                        | CompletedTurnHitKind::ActiveToolCall { .. }
+                        | CompletedTurnHitKind::ToolCall { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(headers.len(), 3);
+        for hit in headers {
+            assert!(app.completed_turn_action_links.iter().any(|link| {
+                link.start_column == hit.start_column
+                    && link.end_column == hit.end_column
+                    && link.row == hit.row
+                    && link.action == crate::action_links::CompletedTurnAction::Collapse
+            }));
+        }
+        if active {
+            assert!(app.current_tab().completed_turn_viewport_anchor().is_none());
+            assert_eq!(app.completed_turn_hits.len(), 3);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        let collapsed = render_to_text(&mut app, 48, 40);
+        assert!(!collapsed.contains("retained reasoning"));
+        assert!(!collapsed.contains("FIRST_QUERY"));
+        if active {
+            app.handle_event(AppEvent::AgentMessageEnd {
+                session_id: DEFAULT_TAB_ID.into(),
+            });
+        }
+    }
+}
+
+#[test]
+fn search_and_thought_hit_rows_follow_scrolling_and_skipped_active_content() {
+    let _locale = crate::test_support::lock_locale();
+    rust_i18n::set_locale("en-US");
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    for index in 0..20 {
+        let id = format!("history-{index}");
+        app.current_tab_mut().completed_turns.push(CompletedTurn {
+            prompt: format!("history prompt {index}"),
+            details: vec![
+                ChatMessage::Thought {
+                    id: Default::default(),
+                    text: "retained history reasoning".into(),
+                    expanded: true,
+                    duration_ms: None,
+                },
+                search_tool_message(&id, "Completed", "history query with wrapped words"),
+            ],
+            expanded: true,
+            trailing_marker: None,
+        });
+        app.current_tab_mut()
+            .expanded_completed_tool_calls
+            .insert(id);
+    }
+    submit_test_prompt(&mut app, "active search");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "active reasoning");
+    app.current_tab_mut().messages.push(search_tool_message(
+        "active",
+        "InProgress",
+        &"active query words ".repeat(40),
+    ));
+    app.current_tab_mut()
+        .expanded_completed_tool_calls
+        .insert("active".into());
+
+    let mut saw_active_thought = false;
+    let mut saw_active_tool = false;
+    let mut saw_history_thought = false;
+    let mut saw_history_tool = false;
+    for offset in (0..180).step_by(3) {
+        app.current_tab_mut().chat_scroll.offset = offset;
+        let buffer = render_to_buffer(&mut app, 48, 20);
+        for hit in &app.completed_turn_hits {
+            let marker = match hit.kind {
+                CompletedTurnHitKind::Thought { active, .. } => {
+                    saw_active_thought |= active;
+                    saw_history_thought |= !active;
+                    "▼"
+                }
+                CompletedTurnHitKind::ActiveToolCall { .. } => {
+                    saw_active_tool = true;
+                    "●"
+                }
+                CompletedTurnHitKind::ToolCall { .. } => {
+                    saw_history_tool = true;
+                    "✓"
+                }
+                _ => continue,
+            };
+            assert_eq!(
+                buffer.cell((hit.start_column, hit.row)).unwrap().symbol(),
+                marker
+            );
+            assert!(app.completed_turn_action_links.iter().any(|link| {
+                link.start_column == hit.start_column
+                    && link.end_column == hit.end_column
+                    && link.row == hit.row
+            }));
+        }
+    }
+    assert!(saw_active_thought && saw_active_tool && saw_history_thought && saw_history_tool);
+    app.current_tab_mut().select_completed_turn(0);
+    let oldest = render_to_text(&mut app, 48, 20);
+    assert!(oldest.contains("history prompt 0"), "{oldest}");
+    assert!(app.completed_turn_hits.iter().all(|hit| !matches!(
+        hit.kind,
+        CompletedTurnHitKind::Thought { active: true, .. }
+            | CompletedTurnHitKind::ActiveToolCall { .. }
+            | CompletedTurnHitKind::ActiveToolGroup { .. }
+    )));
+}
+
+#[test]
+fn active_tool_mouse_release_tracks_identity_after_earlier_tool_removal() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    for grouped in [false, true] {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        submit_test_prompt(&mut app, "search");
+        app.current_tab_mut().messages.push(search_tool_message(
+            "hidden",
+            "InProgress",
+            "hidden query",
+        ));
+        app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "retained reasoning");
+        app.current_tab_mut().finish_thought();
+        app.current_tab_mut().messages.push(search_tool_message(
+            "one",
+            if grouped { "Completed" } else { "InProgress" },
+            "FIRST_QUERY",
+        ));
+        if grouped {
+            app.current_tab_mut().messages.push(search_tool_message(
+                "two",
+                "Completed",
+                "SECOND_QUERY",
+            ));
+        }
+        let find_header = |app: &mut App| {
+            render_to_text(app, 60, 40);
+            *app.completed_turn_hits
+                .iter()
+                .find(|hit| {
+                    let index = match hit.kind {
+                        CompletedTurnHitKind::ActiveToolCall { detail_index } => detail_index,
+                        CompletedTurnHitKind::ActiveToolGroup { first_detail_index, .. } => first_detail_index,
+                        _ => return false,
+                    };
+                    matches!(&app.current_tab().messages[index], ChatMessage::ToolCall { id, .. } if id == "one")
+                })
+                .unwrap()
+        };
+        let mouse = |kind, hit: CompletedTurnHitRegion| {
+            AppEvent::Mouse(MouseEvent {
+                kind,
+                column: hit.start_column,
+                row: hit.row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let pressed = find_header(&mut app);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), pressed));
+        app.handle_event(AppEvent::HideToolCall {
+            session_id: DEFAULT_TAB_ID.into(),
+            id: "hidden".into(),
+        });
+        let released = find_header(&mut app);
+        assert_ne!(pressed.kind, released.kind);
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), released));
+        assert!(app.current_tab().completed_tool_call_expanded("one"));
+        assert_eq!(
+            app.current_tab().completed_tool_call_expanded("two"),
+            grouped
+        );
+        assert!(app.current_tab().messages.iter().any(|message| matches!(
+            message,
+            ChatMessage::Thought {
+                expanded: false,
+                ..
+            }
+        )));
+    }
+}
+
+#[test]
+fn active_tool_query_wraps_retains_updates_and_follows_tool_into_history() {
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "search");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "");
+    let query = format!(
+        "QUERY_START {} QUERY_END",
+        "provider supplied words ".repeat(10)
+    );
+    app.current_tab_mut()
+        .messages
+        .push(search_tool_message("search", "InProgress", &query));
+    if let Some(ChatMessage::ToolCall {
+        content,
+        output: Some(output),
+        ..
+    }) = app.current_tab_mut().messages.last_mut()
+    {
+        content.push(ToolCallContent::Text(output.clone()));
+    }
+    let compact = render_to_text(&mut app, 48, 40);
+    assert!(!compact.contains("QUERY_END"));
+    let hit = *app
+        .completed_turn_hits
+        .iter()
+        .find(|hit| matches!(hit.kind, CompletedTurnHitKind::ActiveToolCall { .. }))
+        .unwrap();
+    click_tool_hit(&mut app, hit);
+    let expanded = render_to_text(&mut app, 48, 40);
+    assert!(
+        expanded.contains("QUERY_START") && expanded.contains("QUERY_END"),
+        "{expanded}"
+    );
+    assert!(expanded.contains("RESULT_search"));
+    assert!(app.current_tab().completed_tool_call_expanded("search"));
+
+    app.handle_event(AppEvent::ToolCallUpdate {
+        session_id: DEFAULT_TAB_ID.into(),
+        id: "search".into(),
+        title: Some("Searching for 'As of...'".into()),
+        status: Some("Completed".into()),
+        kind: None,
+        query: None,
+        location: None,
+        location_is_command: false,
+        output: Some(ToolCallOutput {
+            text: "FINAL_RESULT".into(),
+            truncated: false,
+        }),
+        content: None,
+        locations: Some(Vec::new()),
+        cwd: None,
+        exit_code: None,
+    });
+    let completed = render_to_text(&mut app, 48, 40);
+    assert!(completed.contains("QUERY_END") && completed.contains("FINAL_RESULT"));
+    assert!(!completed.contains("RESULT_search"));
+    assert!(app
+        .completed_turn_hits
+        .iter()
+        .any(|hit| matches!(hit.kind, CompletedTurnHitKind::ActiveToolCall { .. })));
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    let history = render_to_text(&mut app, 48, 40);
+    assert!(
+        history.contains("QUERY_END") && history.contains("FINAL_RESULT"),
+        "{history}"
+    );
+    assert!(app
+        .completed_turn_hits
+        .iter()
+        .any(|hit| matches!(hit.kind, CompletedTurnHitKind::ToolCall { .. })));
+    assert!(!app
+        .completed_turn_hits
+        .iter()
+        .any(|hit| matches!(hit.kind, CompletedTurnHitKind::ActiveToolCall { .. })));
+    let encoded = serde_json::to_string(&app.current_tab().completed_turns[0].details).unwrap();
+    let decoded: Vec<ChatMessage> = serde_json::from_str(&encoded).unwrap();
+    assert!(decoded.iter().any(|message| matches!(message,
+        ChatMessage::ToolCall { query: Some(value), .. } if value.text == query)));
+}
+
+#[test]
+fn active_tool_groups_expand_and_ctrl_o_updates_active_and_cached_history() {
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "search");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "");
+    app.current_tab_mut().messages.extend([
+        search_tool_message("one", "Completed", "FIRST_QUERY"),
+        search_tool_message("two", "Completed", "SECOND_QUERY"),
+    ]);
+    render_to_text(&mut app, 60, 40);
+    let hit = *app
+        .completed_turn_hits
+        .iter()
+        .find(|hit| {
+            matches!(
+                hit.kind,
+                CompletedTurnHitKind::ActiveToolGroup {
+                    detail_count: 2,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    click_tool_hit(&mut app, hit);
+    let expanded = render_to_text(&mut app, 60, 40);
+    for text in ["FIRST_QUERY", "SECOND_QUERY", "RESULT_one", "RESULT_two"] {
+        assert!(expanded.contains(text), "{expanded}");
+    }
+    assert_eq!(
+        app.completed_turn_hits
+            .iter()
+            .filter(|hit| matches!(hit.kind, CompletedTurnHitKind::ActiveToolCall { .. }))
+            .count(),
+        2
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(!render_to_text(&mut app, 60, 40).contains("FIRST_QUERY"));
+    app.handle_event(AppEvent::AgentMessageEnd {
+        session_id: DEFAULT_TAB_ID.into(),
+    });
+    render_to_text(&mut app, 60, 40);
+    submit_test_prompt(&mut app, "next search");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "");
+    app.current_tab_mut()
+        .messages
+        .push(search_tool_message("three", "InProgress", "THIRD_QUERY"));
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    let expanded = render_to_text(&mut app, 60, 40);
+    for text in ["FIRST_QUERY", "SECOND_QUERY", "THIRD_QUERY"] {
+        assert!(expanded.contains(text), "{expanded}");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(!render_to_text(&mut app, 60, 40).contains("THIRD_QUERY"));
+}
+
+#[test]
+fn active_tool_disclosure_anchors_header_and_can_scroll_wrapped_details() {
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "search");
+    app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "");
+    let query = format!("QUERY_START {}", "long search ".repeat(100));
+    app.current_tab_mut()
+        .messages
+        .push(search_tool_message("one", "Completed", &query));
+    render_to_text(&mut app, 42, 20);
+    let hit = *app
+        .completed_turn_hits
+        .iter()
+        .find(|hit| matches!(hit.kind, CompletedTurnHitKind::ActiveToolCall { .. }))
+        .unwrap();
+    click_tool_hit(&mut app, hit);
+    render_to_text(&mut app, 42, 20);
+    let expanded_hit = *app
+        .completed_turn_hits
+        .iter()
+        .find(|candidate| candidate.kind == hit.kind)
+        .unwrap();
+    assert_eq!(hit.row, expanded_hit.row);
+    assert!(app.current_tab().chat_scroll.offset > 0);
+    app.current_tab_mut().scroll_to_bottom();
+    let bottom = render_to_text(&mut app, 42, 20);
+    assert!(bottom.contains("RESULT_one"), "{bottom}");
+    assert!(bottom.contains('…'), "{bottom}");
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(!app.current_tab().completed_tool_call_expanded("one"));
+}
+
+#[test]
+fn active_tool_geometry_does_not_create_completed_turn_controls() {
+    let mut app = test_app();
+    app.state = ConnectionState::Connected;
+    submit_test_prompt(&mut app, "search");
+    app.current_tab_mut().messages.push(search_tool_message(
+        "active",
+        "InProgress",
+        "PROVIDER_QUERY",
+    ));
+    render_to_text(&mut app, 60, 30);
+    assert!(app.current_tab().completed_turns.is_empty());
+    assert_eq!(app.completed_turn_hits.len(), 1);
+    let hit = app.completed_turn_hits[0];
+    assert!(matches!(
+        hit.kind,
+        CompletedTurnHitKind::ActiveToolCall { .. }
+    ));
+    click_tool_hit(&mut app, hit);
+    assert!(render_to_text(&mut app, 60, 30).contains("PROVIDER_QUERY"));
+    assert!(app.current_tab().completed_turns.is_empty());
+    assert!(app.current_tab().selected_completed_turn_idx.is_none());
+    assert!(app.current_tab().completed_turn_viewport_anchor().is_none());
+}
+
+#[test]
+fn active_tool_disclosure_rejects_drag_tab_switch_and_replaced_row() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    for action in ["drag", "tab", "hide", "finish", "outside"] {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        submit_test_prompt(&mut app, "search");
+        app.turn_observe_chunk(DEFAULT_TAB_ID, ChunkKind::Thought, "");
+        app.current_tab_mut().messages.extend([
+            search_tool_message("one", "InProgress", "FIRST_QUERY"),
+            search_tool_message("two", "InProgress", "SECOND_QUERY"),
+        ]);
+        render_to_text(&mut app, 60, 40);
+        let hit = *app
+            .completed_turn_hits
+            .iter()
+            .find(|hit| matches!(hit.kind, CompletedTurnHitKind::ActiveToolCall { .. }))
+            .unwrap();
+        let mouse = |kind, column| {
+            AppEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row: hit.row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.start_column,
+        ));
+        match action {
+            "drag" => app.handle_event(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                hit.start_column + 1,
+            )),
+            "tab" => {
+                app.switch_tab_session("other".into());
+                app.switch_tab_session(DEFAULT_TAB_ID.into());
+            }
+            "hide" => app.handle_event(AppEvent::HideToolCall {
+                session_id: DEFAULT_TAB_ID.into(),
+                id: "one".into(),
+            }),
+            "finish" => app.handle_event(AppEvent::AgentMessageEnd {
+                session_id: DEFAULT_TAB_ID.into(),
+            }),
+            _ => {}
+        }
+        render_to_text(&mut app, 60, 40);
+        let column = if action == "outside" {
+            59
+        } else {
+            hit.start_column
+        };
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), column));
+        assert!(
+            app.current_tab().expanded_completed_tool_calls.is_empty(),
+            "{action}"
+        );
+    }
+}
+
 #[test]
 fn tool_call_partial_update_preserves_status_and_replaces_reported_output() {
     let mut app = test_app();
@@ -15022,6 +15573,7 @@ fn tool_call_partial_update_preserves_status_and_replaces_reported_output() {
     submit_test_prompt(&mut app, "inspect");
     app.handle_event(AppEvent::ToolCall {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool".into(),
         title: "Preparing command".into(),
         status: "InProgress".into(),
@@ -15036,6 +15588,7 @@ fn tool_call_partial_update_preserves_status_and_replaces_reported_output() {
     });
     app.handle_event(AppEvent::ToolCallUpdate {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool".into(),
         title: Some("bash".into()),
         status: Some("Completed".into()),
@@ -15084,6 +15637,7 @@ fn tool_call_update_replaces_and_clears_standard_collections() {
     submit_test_prompt(&mut app, "inspect");
     app.handle_event(AppEvent::ToolCall {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool".into(),
         title: "Edit source".into(),
         status: "InProgress".into(),
@@ -15104,6 +15658,7 @@ fn tool_call_update_replaces_and_clears_standard_collections() {
     });
     app.handle_event(AppEvent::ToolCallUpdate {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool".into(),
         title: None,
         status: None,
@@ -15137,6 +15692,7 @@ fn terminal_output_updates_only_the_tool_call_referencing_the_terminal() {
     submit_test_prompt(&mut app, "run");
     app.handle_event(AppEvent::ToolCall {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool-call-1".into(),
         title: "Run command".into(),
         status: "InProgress".into(),
@@ -15155,6 +15711,7 @@ fn terminal_output_updates_only_the_tool_call_referencing_the_terminal() {
     });
     app.handle_event(AppEvent::ToolCall {
         session_id: DEFAULT_TAB_ID.into(),
+        query: None,
         id: "tool-call-2".into(),
         title: "Run another command".into(),
         status: "InProgress".into(),
@@ -15265,6 +15822,7 @@ fn completed_tool_call_defaults_compact_and_expands_independently() {
         prompt: "Update source".into(),
         details: vec![ChatMessage::ToolCall {
             id: "tool".into(),
+            query: None,
             title: "Edit source".into(),
             status: "Completed".into(),
             kind: ToolCallKind::Edit,
@@ -15346,6 +15904,7 @@ fn failed_completed_tool_keeps_bounded_diagnostic_preview() {
         prompt: "Run checks".into(),
         details: vec![ChatMessage::ToolCall {
             id: "failed-tool".into(),
+            query: None,
             title: "Run checks".into(),
             status: "Failed: tests failed".into(),
             kind: ToolCallKind::Execute,
@@ -15383,6 +15942,7 @@ fn ctrl_o_toggles_all_completed_tool_details_without_folding_turns() {
         details: (0..2)
             .map(|index| ChatMessage::ToolCall {
                 id: format!("tool-{index}"),
+                query: None,
                 title: format!("Read file {index}"),
                 status: "Completed".into(),
                 kind: ToolCallKind::Read,
@@ -15428,6 +15988,7 @@ fn completed_tool_expansion_preserves_its_header_row_and_rebuilds_height() {
         details: vec![
             ChatMessage::ToolCall {
                 id: "anchored-tool".into(),
+                query: None,
                 title: "Run anchored command".into(),
                 status: "Completed".into(),
                 kind: ToolCallKind::Execute,
@@ -15494,6 +16055,7 @@ fn completed_tool_disclosures_anchor_visible_headers_below_clipped_prompts() {
                 .enumerate()
                 .map(|(index, path)| ChatMessage::ToolCall {
                     id: format!("grouped-tool-{index}"),
+                    query: None,
                     title: format!("Viewing {path}"),
                     status: "Completed".into(),
                     kind: ToolCallKind::Read,
@@ -15515,6 +16077,7 @@ fn completed_tool_disclosures_anchor_visible_headers_below_clipped_prompts() {
         } else {
             vec![ChatMessage::ToolCall {
                 id: "individual-tool".into(),
+                query: None,
                 title: "Run INDIVIDUAL_ANCHORED_TOOL".into(),
                 status: "Completed".into(),
                 kind: ToolCallKind::Execute,
@@ -16961,6 +17524,7 @@ fn direct_proposal_defers_history_until_tool_updates_finish() {
     submit_proposal_prompt(&mut app, session_id);
     app.handle_event(AppEvent::ToolCall {
         session_id: session_id.into(),
+        query: None,
         id: "tool-1".into(),
         title: "Inspect files".into(),
         status: "Running".into(),
@@ -16988,6 +17552,7 @@ fn direct_proposal_defers_history_until_tool_updates_finish() {
 
     app.handle_event(AppEvent::ToolCallUpdate {
         session_id: session_id.into(),
+        query: None,
         id: "tool-1".into(),
         title: None,
         status: Some("Completed".into()),
