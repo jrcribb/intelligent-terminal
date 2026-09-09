@@ -439,6 +439,7 @@ impl App {
                 self.cancel_completed_turn_click();
                 if !self.chat_input_has_edit_focus() && !self.current_tab().paste_pending {
                     self.current_tab_mut().input_all_selected = false;
+                    self.current_tab_mut().input_vertical_goal = None;
                 }
                 let is_select_all = matches!(key.code, KeyCode::Char('a'))
                     && key.modifiers == KeyModifiers::CONTROL;
@@ -479,6 +480,7 @@ impl App {
                 self.handle_key(key);
                 if !self.chat_input_has_edit_focus() && !self.current_tab().paste_pending {
                     self.current_tab_mut().input_all_selected = false;
+                    self.current_tab_mut().input_vertical_goal = None;
                 }
             }
             AppEvent::Mouse(mouse) => match mouse.kind {
@@ -524,6 +526,7 @@ impl App {
                 }
                 crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                     self.current_tab_mut().input_all_selected = false;
+                    self.current_tab_mut().input_vertical_goal = None;
                     self.text_selection.handle_mouse(mouse);
                     let click_count = self.text_selection.click_count().unwrap_or(1);
                     if click_count > 1 {
@@ -746,6 +749,9 @@ impl App {
             AppEvent::Resize(w, h) => {
                 self.cancel_completed_turn_click();
                 self.text_selection.clear();
+                if w != self.terminal_cols {
+                    self.invalidate_input_layout();
+                }
                 self.terminal_cols = w;
                 self.terminal_rows = h;
             }
@@ -757,6 +763,7 @@ impl App {
                 self.pane_focused = focused;
                 if !focused {
                     self.current_tab_mut().input_all_selected = false;
+                    self.current_tab_mut().input_vertical_goal = None;
                 }
             }
             AppEvent::ConnectionStage(stage) => {
