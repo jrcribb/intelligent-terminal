@@ -2850,10 +2850,13 @@
     <value>Выберите модель, которую использует этот агент.</value>
   </data>
   <data name="AIAgents_DelegateAgent.Header" xml:space="preserve">
-    <value>Агент</value>
+    <value>CLI агента</value>
+    <comment>{Locked="CLI"} Header for the agent CLI selector in Settings &gt; Agents &gt; Command palette. Here "agent" means an AI intelligent agent (e.g. Copilot, Claude, Gemini), not a proxy or human agent. CLI means command-line interface.</comment>
   </data>
   <data name="AIAgents_DelegateAgent.HelpText" xml:space="preserve">
-    <value>Выберите агента, используемого для быстрых действий в палитре команд.</value>
+    <value>Создайте новую вкладку с CLI предпочитаемого агента, при необходимости добавив начальный запрос и контекст из активной панели.
+Alt+Shift+/ ввести запрос; Alt+Shift+B запустить без начального запроса.</value>
+    <comment>{Locked="CLI","Alt+Shift+/","Alt+Shift+B"} Agent CLI help in Settings &gt; Agents. Keep exactly one line break between the description and the shortcut reference. The UI renders the hotkeys with the same keycap style as Settings &gt; Actions. Start the description after each shortcut with lowercase where the language uses case. Context comes from the active pane; launching without an initial prompt is still interactive. Separate each hotkey and its description with a space, not a colon.</comment>
   </data>
   <data name="AIAgents_AutoFix.Header" xml:space="preserve">
     <value>Автоматически предлагать исправления для команд с ошибками</value>
