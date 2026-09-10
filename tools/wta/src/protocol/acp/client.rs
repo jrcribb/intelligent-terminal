@@ -4629,7 +4629,12 @@ fn dispatch_load_session_with_aliases(
         // `session/load` may replay history before returning, so on large
         // session stores the call can take a while; the timeout ceiling
         // keeps us from hanging forever if the agent never responds.
+        let load_started = std::time::Instant::now();
         let load_result = tokio::time::timeout(timeout, conn.load_session(load_req)).await;
+        crate::telemetry::log_acp_load_session_complete(
+            elapsed_ms_since(load_started),
+            matches!(load_result, Ok(Ok(_))),
+        );
 
         match load_result {
             Ok(Ok(mut resp)) => {
