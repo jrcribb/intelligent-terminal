@@ -1386,9 +1386,9 @@ namespace winrt::TerminalApp::implementation
 
     // ── Save + install flow ─────────────────────────────────────────────
 
-    // Surface a single blocking problem in the bottom-left error area and
-    // apply its remediation. Only one problem is shown at a time so the layout
-    // stays compact; each problem links to step-by-step manual-setup docs.
+    // Surface a single blocking problem in the bottom-left error area. Only
+    // one problem is shown at a time so the layout stays compact; each problem
+    // links to step-by-step manual-setup docs.
     void FreOverlay::_ShowProblem(FreProblemKind kind)
     {
         // Base doc; prerequisites and shell integration deep-link to a section.
@@ -1408,9 +1408,9 @@ namespace winrt::TerminalApp::implementation
         case FreProblemKind::ShellIntegrationExecutionPolicy:
             ErrorText().Text(RS_(L"FreOverlay_InstallErrorShellIntegrationExecutionPolicy"));
             url += L"#41-powershell";
-            // Same remediation as generic shell-integration failure: turn
-            // off error detection so the user can save and continue. Once
-            // they fix execution policy they can re-enable it from Settings.
+            // The automatic CurrentUser remediation did not unblock shell
+            // integration. Turn off error detection so the user can continue;
+            // they can re-enable it after fixing an overriding policy.
             _SetErrorDetectionMode(ErrorDetectionMode::Off);
             if (_settings)
             {
@@ -1810,18 +1810,89 @@ namespace winrt::TerminalApp::implementation
                 ShellIntegrationSweep::InstallTargets::All);
 
             co_await winrt::resume_background();
-            // Profile-gated install: a user keeping only "Developer
-            // PowerShell for VS" (Windows PowerShell) and no pwsh
-            // profile must not get a pwsh integration block written.
-            // RunInstall reports a skipped shell as
-            // success-already-installed so the FRE failure verdict
-            // (below) doesn't flag a missing shell as a failure.
-            const auto results = installShellIntegration();
+            namespace PowerShell = ::Microsoft::Terminal::ShellIntegration::Powershell;
+
+            const auto remediation = PowerShell::RemediateExecutionPoliciesForCurrentUser();
+            const auto logPolicyProbe = [](const char* phase,
+                                           const char* host,
+                                           const PowerShell::ExecutionPolicyProbeResult& probe) {
+                _agentPaneLog(std::string{ "[FRE] EP remediation " } + phase + " " + host +
+                              " status=" + std::to_string(static_cast<int>(probe.status)) +
+                              " policy='" + winrt::to_string(winrt::hstring{ probe.policy }) + "'" +
+                              " timeout=" + (probe.process.timedOut ? "1" : "0") +
+                              " error=" + std::to_string(probe.process.error) +
+                              " exit=" + std::to_string(probe.process.exitCode));
+            };
+            logPolicyProbe("pre", "pwsh", remediation.pwshBefore);
+            logPolicyProbe("pre", "winPs", remediation.windowsPowerShellBefore);
+
+            if (remediation.attempted)
+            {
+                const auto logSetter = [](const char* host, const PowerShell::PowerShellProcessResult& setter) {
+                    _agentPaneLog(std::string{ "[FRE] EP remediation set " } + host +
+                                  " launched=" + (setter.launched ? "1" : "0") +
+                                  " timeout=" + (setter.timedOut ? "1" : "0") +
+                                  " error=" + std::to_string(setter.error) +
+                                  " exit=" + std::to_string(setter.exitCode));
+                };
+                if (remediation.pwshBefore.status == PowerShell::ExecutionPolicyStatus::Blocked)
+                {
+                    logSetter("pwsh", remediation.pwshSetter);
+                }
+                if (remediation.windowsPowerShellBefore.status == PowerShell::ExecutionPolicyStatus::Blocked)
+                {
+                    logSetter("winPs", remediation.windowsPowerShellSetter);
+                }
+                if (remediation.verificationAttempted)
+                {
+                    logPolicyProbe("post", "pwsh", remediation.pwshAfter);
+                    logPolicyProbe("post", "winPs", remediation.windowsPowerShellAfter);
+                }
+            }
+
+            auto remediationSucceeded = remediation.succeeded;
+#ifdef _DEBUG
+            const auto remediationFailureMarker =
+                std::filesystem::path{ winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path().c_str() } /
+                L"fre-e2e-policy-remediation-failure";
+            std::error_code remediationFailureMarkerError;
+            if (std::filesystem::exists(remediationFailureMarker, remediationFailureMarkerError) &&
+                !remediationFailureMarkerError)
+            {
+                _agentPaneLog("[FRE] E2E: forcing execution-policy remediation failure");
+                remediationSucceeded = false;
+            }
+#endif
+
+            ShellIntegrationSweep::InstallSweepResults results{};
+            if (!remediationSucceeded)
+            {
+                _agentPaneLog("[FRE] EP remediation FAILED; skipping shell integration");
+                shellIntegFailed = true;
+                shellIntegEpBlocked = true;
+            }
+            else
+            {
+                _agentPaneLog(remediation.attempted ?
+                                  "[FRE] EP remediation succeeded" :
+                                  "[FRE] EP remediation not needed");
+                // Profile-gated install: a user keeping only "Developer
+                // PowerShell for VS" (Windows PowerShell) and no pwsh
+                // profile must not get a pwsh integration block written.
+                // RunInstall reports a skipped shell as
+                // success-already-installed so the FRE failure verdict
+                // (below) doesn't flag a missing shell as a failure.
+                const auto policyCheck = PowerShell::ExecutionPoliciesVerifiedForInstall(remediation) ?
+                                             ShellIntegrationSweep::PowerShellPolicyCheck::AlreadyVerified :
+                                             ShellIntegrationSweep::PowerShellPolicyCheck::Probe;
+                results = installShellIntegration(policyCheck);
+            }
             const auto& pwsh7Result = results.pwsh;
             const auto& windowsPsResult = results.windowsPowerShell;
             const auto& bashResult = results.bash;
             const auto& wslResults = results.wsl;
 
+            if (remediationSucceeded)
             {
                 std::string detail = "[FRE] Shell integration: pwsh7=";
                 detail += pwsh7Result.success ? "ok" : "FAILED";
@@ -1855,7 +1926,7 @@ namespace winrt::TerminalApp::implementation
             // Bash and WSL failures are NOT counted here: users
             // without Git Bash or without (running) WSL would
             // otherwise see false-alarm errors on every FRE / Save.
-            if (!pwsh7Result.success || !windowsPsResult.success)
+            if (!remediationSucceeded || !pwsh7Result.success || !windowsPsResult.success)
             {
                 shellIntegFailed = true;
                 // If either host's failure was specifically the execution
@@ -1926,15 +1997,18 @@ namespace winrt::TerminalApp::implementation
         // hooks; the unshown failure stays enabled and is retried on next Save.
         if (hooksFailed || shellIntegFailed)
         {
+            const auto problemKind = shellIntegEpBlocked ? FreProblemKind::ShellIntegrationExecutionPolicy
+                                                        : shellIntegFailed ? FreProblemKind::ShellIntegration
+                                                                           : FreProblemKind::Hooks;
             _agentPaneLog("[FRE] Showing problem: "
-                + std::string(shellIntegFailed ? "ShellIntegration" : "Hooks"));
+                + std::string(problemKind == FreProblemKind::ShellIntegrationExecutionPolicy ? "ShellIntegrationExecutionPolicy" :
+                              problemKind == FreProblemKind::ShellIntegration ? "ShellIntegration" :
+                                                                               "Hooks"));
             co_await winrt::resume_foreground(dispatcher);
             auto self = weak.get();
             if (!self) co_return;
 
-            _ShowProblem(shellIntegEpBlocked ? FreProblemKind::ShellIntegrationExecutionPolicy
-                                             : shellIntegFailed ? FreProblemKind::ShellIntegration
-                                                                : FreProblemKind::Hooks);
+            _ShowProblem(problemKind);
             co_return;
         }
 
